@@ -64,3 +64,4 @@ target/
 _build
 _static
 _templates
+environment/*

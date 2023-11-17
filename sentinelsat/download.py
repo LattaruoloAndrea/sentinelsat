@@ -142,11 +142,6 @@ class Downloader:
             # We assume that the product has been downloaded and is complete
             return product_info
 
-        # An incomplete download triggers the retrieval from the LTA if the product is not online
-        if not self.api.is_online(id):
-            self.trigger_offline_retrieval(id)
-            raise LTATriggered(id)
-
         self._download_common(product_info, path, stop_event)
         return product_info
 
@@ -186,16 +181,16 @@ class Downloader:
         skip_download = False
         if temp_path.exists():
             size = temp_path.stat().st_size
-            if size > product_info["size"]:
+            if size > product_info["ContentLength"]:
                 self.logger.warning(
                     "Existing incomplete file %s is larger than the expected final size"
                     " (%s vs %s bytes). Deleting it.",
                     str(temp_path),
                     size,
-                    product_info["size"],
+                    product_info["ContentLength"],
                 )
                 temp_path.unlink()
-            elif size == product_info["size"]:
+            elif size == product_info["ContentLength"]:
                 if self.verify_checksum and not self.api._checksum_compare(temp_path, product_info):
                     # Log a warning since this should never happen
                     self.logger.warning(
@@ -215,10 +210,12 @@ class Downloader:
         if not skip_download:
             # Store the number of downloaded bytes for unit tests
             temp_path.parent.mkdir(parents=True, exist_ok=True)
+            pid = product_info['Id']
+            url = f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({pid})/$value"
             product_info["downloaded_bytes"] = self._download(
-                product_info["url"],
+                url,
                 temp_path,
-                product_info["size"],
+                product_info["ContentLength"],
                 path.name,
                 stop_event,
             )
@@ -259,7 +256,8 @@ class Downloader:
         """
 
         ResultTuple = namedtuple("ResultTuple", ["statuses", "exceptions", "product_infos"])
-        product_ids = list(set(products))
+        product_ids = list(set(products['Id']))
+        print(len(product_ids))
         assert self.n_concurrent_dl > 0
         if len(product_ids) == 0:
             return ResultTuple({}, {}, {})
@@ -267,22 +265,19 @@ class Downloader:
             "Will download %d products using %d workers", len(product_ids), self.n_concurrent_dl
         )
 
-        statuses, online_prods, offline_prods, product_infos, exceptions = self._init_statuses(
-            product_ids
+        statuses = self._init_statuses(
+            product_ids,products
         )
 
         # Skip already downloaded files.
-        # Although the download method also checks, we do not need to retrieve such
-        # products from the LTA and use up our quota.
-        self._skip_existing_products(directory, offline_prods, product_infos, statuses, exceptions)
-
+        products = self._skip_existing_products(directory, products, statuses)
+        product_ids = list(set(products['Id']))
         stop_event = threading.Event()
         dl_tasks = {}
         trigger_tasks = {}
 
-        # Two separate threadpools for downloading and triggering of retrieval.
-        # Otherwise triggering might take up all threads and nothing is downloaded.
-        dl_count = len(online_prods) + len(offline_prods)
+        # One threadpool for downloading.
+        dl_count = len(product_ids)
         dl_executor = ThreadPoolExecutor(
             max_workers=max(1, min(self.n_concurrent_dl, dl_count)),
             thread_name_prefix="dl",
@@ -292,156 +287,96 @@ class Downloader:
             desc="Downloading products",
             unit="product",
         )
-        if offline_prods:
-            trigger_executor = ThreadPoolExecutor(
-                max_workers=min(self.api.concurrent_lta_trigger_limit, len(offline_prods)),
-                thread_name_prefix="trigger",
-            )
-            trigger_progress = self._tqdm(
-                total=len(offline_prods),
-                desc="LTA retrieval",
-                unit="product",
-                leave=True,
-            )
         try:
-            # First all online products are downloaded. Subsequently, offline products that might
-            # have become available in the meantime are requested.
-            for pid in itertools.chain(online_prods, offline_prods):
+            # All online products are downloaded.
+            for index,row in products.iterrows():
                 future = dl_executor.submit(
                     self._download_online_retry,
-                    product_infos[pid],
+                    row['Id'],
+                    row['Name'],
                     directory,
-                    statuses,
-                    exceptions,
                     stop_event,
+                    statuses
                 )
-                dl_tasks[future] = pid
+                # dl_tasks[future] = pid
+        except Exception as e:
+            raise(Exception(f"Error during downloading! {e}"))
+        return ResultTuple(statuses, {}, {})
+        #     for task in concurrent.futures.as_completed(list(trigger_tasks) + list(dl_tasks)):
+        #         pid = trigger_tasks.get(task) or dl_tasks[task]
+        #         exception = exceptions.get(pid)
+        #         if task.cancelled():
+        #             exception = concurrent.futures.CancelledError()
+        #         if task.exception():
+        #             exception = task.exception()
 
-            for pid in offline_prods:
-                future = trigger_executor.submit(
-                    self._trigger_and_wait,
-                    pid,
-                    stop_event,
-                    statuses,
-                )
-                trigger_tasks[future] = pid
+        #         if task in dl_tasks:
+        #             if not exception:
+        #                 product_infos[pid] = task.result()
+        #                 statuses[pid] = DownloadStatus.DOWNLOADED
+        #             dl_progress.update()
+        #             # Keep the LTA progress fresh
+        #             if offline_prods:
+        #                 trigger_progress.update(0)
+        #         else:
+        #             trigger_progress.update()
+        #             if all(t.done() for t in trigger_tasks):
+        #                 trigger_progress.close()
 
-            for task in concurrent.futures.as_completed(list(trigger_tasks) + list(dl_tasks)):
-                pid = trigger_tasks.get(task) or dl_tasks[task]
-                exception = exceptions.get(pid)
-                if task.cancelled():
-                    exception = concurrent.futures.CancelledError()
-                if task.exception():
-                    exception = task.exception()
+        #         if exception:
+        #             exceptions[pid] = exception
+        #             if self.fail_fast:
+        #                 raise exception from None
+        #             else:
+        #                 self.logger.error("%s failed: %s", pid, _format_exception(exception))
+        # except:
+        #     stop_event.set()
+        #     for t in list(trigger_tasks) + list(dl_tasks):
+        #         t.cancel()
+        #     raise
+        # finally:
+        #     dl_executor.shutdown()
+        #     dl_progress.close()
+        #     if offline_prods:
+        #         trigger_executor.shutdown()
+        #         trigger_progress.close()
 
-                if task in dl_tasks:
-                    if not exception:
-                        product_infos[pid] = task.result()
-                        statuses[pid] = DownloadStatus.DOWNLOADED
-                    dl_progress.update()
-                    # Keep the LTA progress fresh
-                    if offline_prods:
-                        trigger_progress.update(0)
-                else:
-                    trigger_progress.update()
-                    if all(t.done() for t in trigger_tasks):
-                        trigger_progress.close()
+        # if not any(statuses):
+        #     if not exceptions:
+        #         raise SentinelAPIError("Downloading all products failed for an unknown reason")
+        #     exception = list(exceptions)[0]
+        #     raise exception
 
-                if exception:
-                    exceptions[pid] = exception
-                    if self.fail_fast:
-                        raise exception from None
-                    else:
-                        self.logger.error("%s failed: %s", pid, _format_exception(exception))
-        except:
-            stop_event.set()
-            for t in list(trigger_tasks) + list(dl_tasks):
-                t.cancel()
-            raise
-        finally:
-            dl_executor.shutdown()
-            dl_progress.close()
-            if offline_prods:
-                trigger_executor.shutdown()
-                trigger_progress.close()
+        # # Update Online status in product_infos
+        # for pid, status in statuses.items():
+        #     if status in [DownloadStatus.OFFLINE, DownloadStatus.TRIGGERED]:
+        #         product_infos[pid]["Online"] = False
+        #     elif status != DownloadStatus.UNAVAILABLE:
+        #         product_infos[pid]["Online"] = True
 
-        if not any(statuses):
-            if not exceptions:
-                raise SentinelAPIError("Downloading all products failed for an unknown reason")
-            exception = list(exceptions)[0]
-            raise exception
+        # return ResultTuple(statuses, exceptions, product_infos)
 
-        # Update Online status in product_infos
-        for pid, status in statuses.items():
-            if status in [DownloadStatus.OFFLINE, DownloadStatus.TRIGGERED]:
-                product_infos[pid]["Online"] = False
-            elif status != DownloadStatus.UNAVAILABLE:
-                product_infos[pid]["Online"] = True
-
-        return ResultTuple(statuses, exceptions, product_infos)
-
-    def _init_statuses(self, product_ids):
+    def _init_statuses(self, product_ids,products):
+        # print(product_ids)
         statuses = {pid: DownloadStatus.UNAVAILABLE for pid in product_ids}
-        online_prods = set()
-        offline_prods = set()
-        product_infos = {}
-        exceptions = {}
-        # Get online status and product info.
-        for pid in self._tqdm(
-            iterable=product_ids, desc="Fetching archival status", unit="product", delay=2
-        ):
-            assert isinstance(pid, str)
-            try:
-                info = self.api.get_product_odata(pid)
-            except UnauthorizedError:
-                raise
-            except SentinelAPIError as e:
-                exceptions[pid] = e
-                if self.fail_fast:
-                    raise
-                self.logger.error(
-                    "Getting product info for %s failed, can't download: %s",
-                    pid,
-                    _format_exception(e),
-                )
-                continue
-            product_infos[pid] = info
-            if product_infos[pid]["Online"]:
+        for index,row in products.iterrows():
+            pid = row['Id']
+            if row['Online'] == 'Online':
                 statuses[pid] = DownloadStatus.ONLINE
-                online_prods.add(pid)
             else:
                 statuses[pid] = DownloadStatus.OFFLINE
-                offline_prods.add(pid)
-        return statuses, online_prods, offline_prods, product_infos, exceptions
+        return statuses
 
-    def _skip_existing_products(self, directory, products, product_infos, statuses, exceptions):
-        for pid in list(products):
-            product_info = product_infos[pid]
-            try:
-                filename = self.api._get_filename(product_info)
-            except SentinelAPIError as e:
-                exceptions[pid] = e
-                if self.fail_fast:
-                    raise
-                self.logger.error(
-                    "Getting filename for %s (%s) failed: %s",
-                    product_info["title"],
-                    pid,
-                    _format_exception(e),
-                )
-                continue
+    def _skip_existing_products(self, directory, products, statuses):
+        for index,row in products.iterrows():
+            pid = row['Id']
+            filename = row['Name']
             path = Path(directory) / filename
             if path.exists():
                 self.logger.info("Skipping already downloaded %s.", filename)
-                product_info["path"] = str(path)
                 statuses[pid] = DownloadStatus.DOWNLOADED
-                products.remove(pid)
-            else:
-                self.logger.info(
-                    "%s (%s) is in the LTA and retrieval will be triggered.",
-                    product_info["title"],
-                    pid,
-                )
+                products.drop([index])
+        return products     
 
     def trigger_offline_retrieval(self, uuid):
         """Triggers retrieval of an offline product.
@@ -662,32 +597,28 @@ class Downloader:
             self.logger.info("%s retrieval from LTA completed", uuid)
             statuses[uuid] = DownloadStatus.ONLINE
 
-    def _download_online_retry(self, product_info, directory, statuses, exceptions, stop_event):
+    def _download_online_retry(self, pid: str,name: str, directory,stop_event: threading.Event,statuses):
         """Thin wrapper around download with retrying and checking whether a product is online
 
         Parameters
         ----------
-        product_info : dict
+        product_info : str
+        name: str
         directory : string, optional
-        statuses : dict of DownloadStatus
-        exceptions : dict of Exception
         stop_event : threading.Event
+        statuses : dict of DownloadStatus
         """
         if self.max_attempts <= 0:
             return
 
-        uuid = product_info["id"]
-        title = product_info["title"]
+        uuid = pid
+        title = name
 
         # Wait for the triggering and retrieval to complete first
-        while (
-            statuses[uuid] != DownloadStatus.ONLINE
-            and uuid not in exceptions
-            and not stop_event.is_set()
-        ):
+        print("1",stop_event.is_set())
+        while (stop_event.is_set()):
+            print("Waiting")
             _wait(stop_event, 1)
-        if uuid in exceptions:
-            return
 
         last_exception = None
         for cnt in range(self.max_attempts):
@@ -723,12 +654,16 @@ class Downloader:
     def _download(self, url, path, file_size, title, stop_event):
         headers = {}
         continuing = path.exists()
+        access_token = self.api.token
         if continuing:
             already_downloaded_bytes = path.stat().st_size
-            headers = {"Range": "bytes={}-".format(already_downloaded_bytes)}
+            # input(f"ACCESS TOKEN: {access_token}")
+            headers = {"Authorization": f"Bearer {access_token}","Range": "bytes={}-".format(already_downloaded_bytes)}
         else:
             already_downloaded_bytes = 0
+            headers = {"Authorization": f"Bearer {access_token}"}
         downloaded_bytes = 0
+        # self.api.session.get(url, stream=True, headers=headers)
         with self.api.dl_limit_semaphore:
             r = self.api.session.get(url, stream=True, headers=headers)
         with self._tqdm(

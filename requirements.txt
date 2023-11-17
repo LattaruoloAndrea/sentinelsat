@@ -4,3 +4,6 @@ html2text
 geojson >= 2
 tqdm >= 4.58
 geomet
+pandas
+openeo
+requests_oauthlib

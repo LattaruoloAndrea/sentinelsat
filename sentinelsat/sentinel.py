@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import threading
+import pandas as pd
 import xml.etree.ElementTree as ET
 from collections import OrderedDict, defaultdict, namedtuple
 from copy import copy
@@ -18,14 +19,19 @@ from tqdm.auto import tqdm
 
 from sentinelsat.download import DownloadStatus, Downloader
 from sentinelsat.exceptions import (
+    InvalidAoi,
     InvalidChecksumError,
+    InvalidDataCollection,
+    InvalidFormatDate,
     InvalidKeyError,
+    InvalidOrderBy,
     QueryLengthError,
     QuerySyntaxError,
     SentinelAPIError,
     ServerError,
     UnauthorizedError,
 )
+from sentinelsat.helper import correct_data_collections, correct_format_date, valid_aoi, valid_order_by
 from . import __version__ as sentinelsat_version
 
 
@@ -69,20 +75,21 @@ class SentinelAPI:
         self,
         user,
         password,
-        api_url="https://apihub.copernicus.eu/apihub/",
+        identity_api_url="https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token",
         show_progressbars=True,
         timeout=60,
     ):
         self.session = requests.Session()
         if user and password:
             self.session.auth = (user, password)
-        self.api_url = api_url if api_url.endswith("/") else api_url + "/"
+        self.identity_api_url = identity_api_url if identity_api_url.endswith("/") else identity_api_url + "/"
         self.page_size = 100
         self.user_agent = "sentinelsat/" + sentinelsat_version
         self.session.headers["User-Agent"] = self.user_agent
         self.session.timeout = timeout
         self.show_progressbars = show_progressbars
         self._dhus_version = None
+        self.token = self._get_access_token(user,password)
         # For unit tests
         self._last_query = None
         self._last_response = None
@@ -95,7 +102,7 @@ class SentinelAPI:
         # We use a bounded semaphore to ensure we stay within that limit.
         # Notably, LTA trigger requests also count against that limit.
         self._dl_limit_semaphore = threading.BoundedSemaphore(self._concurrent_dl_limit)
-        self._lta_limit_semaphore = threading.BoundedSemaphore(self._concurrent_lta_trigger_limit)
+        # self._lta_limit_semaphore = threading.BoundedSemaphore(self._concurrent_lta_trigger_limit)
 
         self.downloader = Downloader(self)
 
@@ -180,17 +187,32 @@ class SentinelAPI:
         if self._dhus_version is None:
             self._dhus_version = self._req_dhus_stub()
         return self._dhus_version
+    
+    def _get_access_token(self,username: str, password: str) -> str:
+        data = {
+            "client_id": "cdse-public",
+            "username": username,
+            "password": password,
+            "grant_type": "password",
+        }
+        try:
+            r = requests.post(self.identity_api_url,
+                            data=data,
+                            )
+            r.raise_for_status()
+        except Exception as e:
+            raise Exception(
+                f"Access token creation failed. Reponse from the server was: {r.json()}"
+            )
+        return r.json()["access_token"]
 
     def query(
         self,
-        area=None,
-        date=None,
-        raw=None,
-        area_relation="Intersects",
-        order_by=None,
-        limit=None,
-        offset=0,
-        **keywords
+        start_date= None,
+        end_date= None,
+        data_collection= None,
+        aoi= None,
+        order_by= None,
     ):
         """Query the OpenSearch API with the coordinates of an area, a date interval
         and any other search keywords accepted by the API.
@@ -258,76 +280,92 @@ class SentinelAPI:
             Products returned by the query as a dictionary with the product ID as the key and
             the product's attributes (a dictionary) as the value.
         """
-        query = self.format_query(area, date, raw, area_relation, **keywords)
+        query = self.format_query(start_date= start_date,end_date= end_date,data_collection= data_collection,aoi= aoi,order_by= order_by)
+        # query = self.format_query(area, date, raw, area_relation, **keywords)
 
         if query.strip() == "":
             # An empty query should return the full set of products on the server, which is a bit unreasonable.
             # The server actually raises an error instead and it's better to fail early in the client.
             raise ValueError("Empty query.")
 
-        # check query length - often caused by complex polygons
-        if self.check_query_length(query) > 1.0:
-            self.logger.warning(
-                "The query string is too long and will likely cause a bad DHuS response."
-            )
-
         self.logger.debug(
-            "Running query: order_by=%s, limit=%s, offset=%s, query=%s",
+            "Running query: order_by=%s, start_date=%s, end_date=%s, query=%s",
             order_by,
-            limit,
-            offset,
+            start_date,
+            end_date,
             query,
         )
-        formatted_order_by = _format_order_by(order_by)
-        response, count = self._load_query(query, formatted_order_by, limit, offset)
-        self.logger.info(f"Found {count:,} products")
-        return _parse_opensearch_response(response)
+        odata_url = "https://catalogue.dataspace.copernicus.eu/odata/v1/"
+        return self.query_call(odata_url,query=query)
+        # formatted_order_by = _format_order_by(order_by)
+        # response, count = self._load_query(query, formatted_order_by, limit, offset)
+        # self.logger.info(f"Found {count:,} products")
+        # return _parse_opensearch_response(response)
 
     @staticmethod
-    def format_query(area=None, date=None, raw=None, area_relation="Intersects", **keywords):
+    def format_query(start_date= None,end_date= None,data_collection= None,aoi= None,order_by= None):
         """Create a OpenSearch API query string."""
-        if area_relation.lower() not in {"intersects", "contains", "iswithin"}:
-            raise ValueError("Incorrect AOI relation provided ({})".format(area_relation))
-
-        # Check for duplicate keywords
-        kw_lower = {x.lower() for x in keywords}
-        if (
-            len(kw_lower) != len(keywords)
-            or (date is not None and "beginposition" in kw_lower)
-            or (area is not None and "footprint" in kw_lower)
-        ):
-            raise ValueError(
-                "Query contains duplicate keywords. Note that query keywords are case-insensitive."
-            )
-
-        query_parts = []
-
-        if date is not None:
-            keywords["beginPosition"] = date
-
-        for attr, value in sorted(keywords.items()):
-            if isinstance(value, set):
-                if len(value) == 0:
-                    continue
-                sub_parts = []
-                for sub_value in value:
-                    sub_value = _format_query_value(attr, sub_value)
-                    if sub_value is not None:
-                        sub_parts.append(f"{attr}:{sub_value}")
-                sub_parts = sorted(sub_parts)
-                query_parts.append("({})".format(" OR ".join(sub_parts)))
+        # k = f"Name eq '{data_collection}' and OData.CSC.Intersects(area=geography'SRID=4326;{aoi}) and ContentDate/Start gt {start_date}T00:00:00.000Z and ContentDate/Start lt {end_date}T00:00:00.000Z"
+        pieces = []
+        if data_collection != None:
+            if correct_data_collections(data_collection):
+                data_collection_query = f"$filter=Collection/Name eq '{data_collection}'"
+                pieces.append(data_collection_query)
             else:
-                value = _format_query_value(attr, value)
-                if value is not None:
-                    query_parts.append(f"{attr}:{value}")
+                error_msg = f"The data collection inderted is not one of the valid! {['Sentinel-1','Sentinel-2']}"
+                raise(InvalidDataCollection(error_msg))
+        if start_date != None:
+            if correct_format_date(start_date):
+                start_date_query = f"ContentDate/Start gt {start_date}T00:00:00.000Z"
+                pieces.append(start_date_query)
+            else:
+                error_msg = f"The starting date inserted is not valid! {start_date} is not in the format required yyyy-mm-dd!"
+                raise(InvalidFormatDate(error_msg))
+        if end_date != None:
+            if correct_format_date(end_date):
+                end_date_query = f"ContentDate/Start lt {end_date}T00:00:00.000Z"
+                pieces.append(end_date_query)
+            else:
+                error_msg = f"The ending date inserted is not valid! {end_date} is not in the format required yyyy-mm-dd!"
+                raise(InvalidFormatDate(error_msg))
+        if aoi!= None:
+            if valid_aoi(aoi):
+                aoi_query = f"OData.CSC.Intersects(area=geography'SRID=4326;{aoi})"
+                pieces.append(aoi_query)
+            else:
+                error_msg = "The aoi geometry inserted is not valid!"
+                raise(InvalidAoi(error_msg))
+        if order_by != None:
+            if valid_order_by(order_by):
+                order_by_query = f""
+                pieces.append(order_by_query)
+            else:
+                error_msg = "The order by inserted is not valid!"
+                raise(InvalidOrderBy(error_msg))
+        full_query = "Products?"
+        for i in range(len(pieces)):
+            full_query+= pieces[i]
+            if i!= len(pieces)-1:
+                full_query+= " and "
+        return full_query
+    
+    def query_call(self,url=None,query=None):
+        total_url = url
+        print(f"{url}{query}")
+        if query!= None:
+            total_url += query
+        json_ = requests.get(f"{url}{query}").json()
+        if 'value' in json_:
+            df = self.to_dataframe(json_["value"])
+            return df
+        else:
+            df = self.to_dataframe(json_)
+            return df
+    
+    def json_query_call(self,url):
+        json_ = requests.get(f"{url}").json()
+        return json_
 
-        if raw:
-            query_parts.append(raw)
-
-        if area is not None:
-            query_parts.append('footprint:"{}({})"'.format(area_relation, area))
-
-        return " ".join(query_parts)
 
     def count(self, area=None, date=None, raw=None, area_relation="Intersects", **keywords):
         """Get the number of products matching a query.
@@ -449,7 +487,7 @@ class SentinelAPI:
         except ImportError:
             raise ImportError("to_dataframe requires the optional dependency Pandas.")
 
-        return pd.DataFrame.from_dict(products, orient="index")
+        return pd.DataFrame.from_dict(products)
 
     @staticmethod
     def to_geodataframe(products):
@@ -475,6 +513,7 @@ class SentinelAPI:
         return gpd.GeoDataFrame(df, crs=crs, geometry=geometry)
 
     def get_product_odata(self, id, full=False):
+        # TODO get product Odata 
         """Access OData API to get info about a product.
 
         Returns a dict containing the id, title, size, md5sum, date, footprint and download url
@@ -504,20 +543,21 @@ class SentinelAPI:
         https://github.com/SentinelDataHub/DataHubSystem/blob/master/addon/sentinel-3/src/main/resources/META-INF/sentinel-3.owl
         """
         url = self._get_odata_url(id, "?$format=json")
-        if full:
-            url += "&$expand=Attributes"
-        with self.dl_limit_semaphore:
-            response = self.session.get(url)
-        self._check_scihub_response(response)
-        values = _parse_odata_response(response.json()["d"])
-        if values["title"].startswith("S3"):
-            values["manifest_name"] = "xfdumanifest.xml"
-            values["product_root_dir"] = values["title"] + ".SEN3"
-        else:
-            values["manifest_name"] = "manifest.safe"
-            values["product_root_dir"] = values["title"] + ".SAFE"
-        values["quicklook_url"] = self._get_odata_url(id, "/Products('Quicklook')/$value")
-        return values
+        products = self.json_query_call(url)
+        # if full:
+        #     url += "&$expand=Attributes"
+        # with self.dl_limit_semaphore:
+        #     response = self.session.get(url)
+        # self._check_scihub_response(response)
+        # values = _parse_odata_response(response.json()["d"])
+        # if values["title"].startswith("S3"):
+        #     values["manifest_name"] = "xfdumanifest.xml"
+        #     values["product_root_dir"] = values["title"] + ".SEN3"
+        # else:
+        #     values["manifest_name"] = "manifest.safe"
+        #     values["product_root_dir"] = values["title"] + ".SAFE"
+        # values["quicklook_url"] = self._get_odata_url(id, "/Products('Quicklook')/$value")
+        return products
 
     def is_online(self, id):
         """Returns whether a product is online
@@ -596,20 +636,7 @@ class SentinelAPI:
         return downloader.download(id, directory_path)
 
     def _get_filename(self, product_info):
-        if product_info["Online"]:
-            with self.dl_limit_semaphore:
-                req = self.session.head(product_info["url"])
-            self._check_scihub_response(req, test_json=False)
-            cd = req.headers.get("Content-Disposition")
-            if cd is not None:
-                filename = cd.split("=", 1)[1].strip('"')
-                return filename
-        with self.dl_limit_semaphore:
-            req = self.session.get(
-                product_info["url"].replace("$value", "Attributes('Filename')/Value/$value")
-            )
-        self._check_scihub_response(req, test_json=False)
-        filename = req.text
+        filename = product_info['Name']
         # This should cover all currently existing file types: .SAFE, .SEN3, .nc and .EOF
         filename = filename.replace(".SAFE", ".zip")
         filename = filename.replace(".SEN3", ".zip")
@@ -1008,7 +1035,7 @@ class SentinelAPI:
         return self.downloader.get_stream(id, **kwargs)
 
     def _get_odata_url(self, uuid, suffix=""):
-        return self.api_url + f"odata/v1/Products('{uuid}')" + suffix
+        return "https://catalogue.dataspace.copernicus.eu/" + f"odata/v1/Products({uuid})" + suffix
 
     def _get_download_url(self, uuid):
         return self._get_odata_url(uuid, "/$value")
