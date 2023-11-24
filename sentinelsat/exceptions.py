@@ -105,3 +105,27 @@ class InvalidAoi(Exception):
 class InvalidOrderBy(Exception):
     """"""
     pass
+
+class InvalidProductType(Exception):
+    """"""
+    pass
+
+class InvalidMode(Exception):
+    """"""
+    pass
+
+class InvalidDirection(Exception):
+    """"""
+    pass
+
+class InvalidOrbit(Exception):
+    """"""
+    pass
+
+class InvalidTileId(Exception):
+    """"""
+    pass
+
+class InvalidPLevel(Exception):
+    """"""
+    pass

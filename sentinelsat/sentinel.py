@@ -7,10 +7,11 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict, defaultdict, namedtuple
 from copy import copy
 from datetime import date, datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict
 from urllib.parse import quote_plus, urljoin
-
+import time
 import geojson
 import geomet.wkt
 import html2text
@@ -22,16 +23,22 @@ from sentinelsat.exceptions import (
     InvalidAoi,
     InvalidChecksumError,
     InvalidDataCollection,
+    InvalidDirection,
     InvalidFormatDate,
     InvalidKeyError,
+    InvalidMode,
+    InvalidOrbit,
     InvalidOrderBy,
+    InvalidPLevel,
+    InvalidProductType,
+    InvalidTileId,
     QueryLengthError,
     QuerySyntaxError,
     SentinelAPIError,
     ServerError,
     UnauthorizedError,
 )
-from sentinelsat.helper import correct_data_collections, correct_format_date, valid_aoi, valid_order_by
+from sentinelsat.helper import correct_data_collections, correct_format_date, valid_aoi, valid_direction, valid_mode, valid_orbit, valid_order_by, valid_plevel, valid_product_type, valid_tileId
 from . import __version__ as sentinelsat_version
 
 
@@ -89,7 +96,8 @@ class SentinelAPI:
         self.session.timeout = timeout
         self.show_progressbars = show_progressbars
         self._dhus_version = None
-        self.token = self._get_access_token(user,password)
+        self.time_stamp_login = 0
+        self.token,self.refresh_token,self.token_expires_in,self.refresh_expires_in = self._get_access_token(user,password)
         # For unit tests
         self._last_query = None
         self._last_response = None
@@ -103,6 +111,13 @@ class SentinelAPI:
         # Notably, LTA trigger requests also count against that limit.
         self._dl_limit_semaphore = threading.BoundedSemaphore(self._concurrent_dl_limit)
         # self._lta_limit_semaphore = threading.BoundedSemaphore(self._concurrent_lta_trigger_limit)
+        # self.token_executor_checker = ThreadPoolExecutor(
+        #     max_workers=1,
+        #     thread_name_prefix="token",
+        # )
+        # self.token_executor_checker.submit(
+        #     self.verify_token
+        # )
 
         self.downloader = Downloader(self)
 
@@ -114,79 +129,99 @@ class SentinelAPI:
     @concurrent_dl_limit.setter
     def concurrent_dl_limit(self, value):
         self._concurrent_dl_limit = value
-        self._lta_limit_semaphore = threading.BoundedSemaphore(self._concurrent_dl_limit)
+        # self._lta_limit_semaphore = threading.BoundedSemaphore(self._concurrent_dl_limit)
 
-    @property
-    def concurrent_lta_trigger_limit(self):
-        """int: Maximum number of concurrent Long Term Archive retrievals allowed."""
-        return self._concurrent_lta_trigger_limit
+    # @property
+    # def concurrent_lta_trigger_limit(self):
+    #     """int: Maximum number of concurrent Long Term Archive retrievals allowed."""
+    #     return self._concurrent_lta_trigger_limit
 
-    @concurrent_lta_trigger_limit.setter
-    def concurrent_lta_trigger_limit(self, value):
-        self._concurrent_lta_trigger_limit = value
-        self._dl_limit_semaphore = threading.BoundedSemaphore(self._concurrent_lta_trigger_limit)
+    # @concurrent_lta_trigger_limit.setter
+    # def concurrent_lta_trigger_limit(self, value):
+    #     self._concurrent_lta_trigger_limit = value
+    #     self._dl_limit_semaphore = threading.BoundedSemaphore(self._concurrent_lta_trigger_limit)
 
-    @property
-    def dl_retry_delay(self):
-        """float, default 10: Number of seconds to wait between retrying of failed downloads."""
-        return self.downloader.dl_retry_delay
+    # @property
+    # def dl_retry_delay(self):
+    #     """float, default 10: Number of seconds to wait between retrying of failed downloads."""
+    #     return self.downloader.dl_retry_delay
 
-    @dl_retry_delay.setter
-    def dl_retry_delay(self, value):
-        self.downloader.dl_retry_delay = value
+    # @dl_retry_delay.setter
+    # def dl_retry_delay(self, value):
+    #     self.downloader.dl_retry_delay = value
 
-    @property
-    def lta_retry_delay(self):
-        """float, default 60: Number of seconds to wait between requests to the Long Term Archive."""
-        return self.downloader.lta_retry_delay
+    # @property
+    # def lta_retry_delay(self):
+    #     """float, default 60: Number of seconds to wait between requests to the Long Term Archive."""
+    #     return self.downloader.lta_retry_delay
 
-    @lta_retry_delay.setter
-    def lta_retry_delay(self, value):
-        self.downloader.lta_retry_delay = value
+    # @lta_retry_delay.setter
+    # def lta_retry_delay(self, value):
+    #     self.downloader.lta_retry_delay = value
 
-    @property
-    def lta_timeout(self):
-        """float, optional: Maximum number of seconds to wait for triggered products to come online.
-        Defaults to no timeout."""
-        return self.downloader.lta_timeout
+    # @property
+    # def lta_timeout(self):
+    #     """float, optional: Maximum number of seconds to wait for triggered products to come online.
+    #     Defaults to no timeout."""
+    #     return self.downloader.lta_timeout
 
-    @lta_timeout.setter
-    def lta_timeout(self, value):
-        self.downloader.lta_timeout = value
+    # @lta_timeout.setter
+    # def lta_timeout(self, value):
+    #     self.downloader.lta_timeout = value
 
     @property
     def dl_limit_semaphore(self):
         return self._dl_limit_semaphore
 
-    @property
-    def lta_limit_semaphore(self):
-        return self._lta_limit_semaphore
+    # @property
+    # def lta_limit_semaphore(self):
+    #     return self._lta_limit_semaphore
 
-    @staticmethod
-    def _api2dhus_url(api_url):
-        url = re.sub("apihub/$", "dhus/", api_url)
-        url = re.sub("apihub.copernicus.eu", "scihub.copernicus.eu", url)
-        return url
+    # @staticmethod
+    # def _api2dhus_url(api_url):
+    #     url = re.sub("apihub/$", "dhus/", api_url)
+    #     url = re.sub("apihub.copernicus.eu", "scihub.copernicus.eu", url)
+    #     return url
 
-    def _req_dhus_stub(self):
-        try:
-            with self.dl_limit_semaphore:
-                resp = self.session.get(self.api_url + "api/stub/version")
-            resp.raise_for_status()
-        except requests.exceptions.HTTPError as err:
-            self.logger.error("HTTPError: %s", err)
-            self.logger.error("Are you trying to get the DHuS version of APIHub?")
-            self.logger.error("Trying again after conversion to DHuS URL")
-            with self.dl_limit_semaphore:
-                resp = self.session.get(self._api2dhus_url(self.api_url) + "api/stub/version")
-            resp.raise_for_status()
-        return resp.json()["value"]
+    # def _req_dhus_stub(self):
+    #     try:
+    #         with self.dl_limit_semaphore:
+    #             resp = self.session.get(self.api_url + "api/stub/version")
+    #         resp.raise_for_status()
+    #     except requests.exceptions.HTTPError as err:
+    #         self.logger.error("HTTPError: %s", err)
+    #         self.logger.error("Are you trying to get the DHuS version of APIHub?")
+    #         self.logger.error("Trying again after conversion to DHuS URL")
+    #         with self.dl_limit_semaphore:
+    #             resp = self.session.get(self._api2dhus_url(self.api_url) + "api/stub/version")
+    #         resp.raise_for_status()
+    #     return resp.json()["value"]
+    
+    def if_token_expired_refresh(self):
+        current_timestamp  = time.time()
+        min_10_in_s = self.token_expires_in # seconds
+        if self.time_stamp_login +min_10_in_s > current_timestamp:
+            #10 minutes not passed
+            print("token not expired")
+            pass
+        else:
+            min_60_in_s = self.refresh_expires_in # seconds
+            if self.time_stamp_login +min_60_in_s > current_timestamp:
+                #refresh token still valid
+                print("token expired use of the refresh token")
+                self.token,self.refresh_token,self.token_expires_in,self.refresh_expires_in = self.refresh_access_token(self.refresh_token)
+            else:
+                #refresh token not valid
+                print("token expired and refresh token expired")
+                user = self.session.auth[0]
+                password = self.session.auth[1]
+                self.token,self.refresh_token,self.token_expires_in,self.refresh_expires_in = self._get_access_token(user,password)
 
-    @property
-    def dhus_version(self):
-        if self._dhus_version is None:
-            self._dhus_version = self._req_dhus_stub()
-        return self._dhus_version
+    # @property
+    # def dhus_version(self):
+    #     if self._dhus_version is None:
+    #         self._dhus_version = self._req_dhus_stub()
+    #     return self._dhus_version
     
     def _get_access_token(self,username: str, password: str) -> str:
         data = {
@@ -200,11 +235,47 @@ class SentinelAPI:
                             data=data,
                             )
             r.raise_for_status()
+            self.time_stamp_login = time.time()
         except Exception as e:
             raise Exception(
                 f"Access token creation failed. Reponse from the server was: {r.json()}"
             )
-        return r.json()["access_token"]
+        json_ = r.json()
+        return json_["access_token"],json_["refresh_token"],json_["expires_in"],json_["refresh_expires_in"]
+
+    def refresh_access_token(self,refresh_token):
+        data= {
+            'grant_type': 'refresh_token',
+            'refresh_token': refresh_token,
+            'client_id': 'cdse-public'
+        }
+        header = {'Content-Type': 'application/x-www-form-urlencoded'}
+        try:
+            r = requests.post(self.identity_api_url,
+                              headers=header,
+                              data=data,
+                            )
+            r.raise_for_status()
+            self.time_stamp_login = time.time()
+        except Exception as e:
+            print(f"Refresh token use failed. Reponse from the server was: {r.json()}")
+            raise Exception(
+                f"Refresh token use failed. Reponse from the server was: {r.json()}"
+            )
+        json_ = r.json()
+        return json_["access_token"],json_["refresh_token"],json_["expires_in"],json_["refresh_expires_in"]
+
+    def verify_token(self):
+        while True:
+            time.sleep(60) # sleep for 1 minutes
+            print("Verify token")
+            self.if_token_expired_refresh()
+
+    def query_sentinel_1(self,start_date,end_date,point,direction=None,orbit=None):
+        return self.query(start_date=start_date,end_date=end_date,order_by='asc',data_collection='SENTINEL-1',product_type='SLC',mode='IW',aoi=point,direction=direction,orbit=orbit)
+
+    def query_sentinel_2(self,start_date,end_date,tile_id):
+        return self.query(start_date=start_date,end_date=end_date,tileid=tile_id,order_by='asc',data_collection='SENTINEL-2',plevel='S2MSI2A')
 
     def query(
         self,
@@ -213,6 +284,12 @@ class SentinelAPI:
         data_collection= None,
         aoi= None,
         order_by= None,
+        product_type = None,
+        mode = None,
+        direction = None,
+        orbit = None,
+        plevel = None,
+        tileid = None,
     ):
         """Query the OpenSearch API with the coordinates of an area, a date interval
         and any other search keywords accepted by the API.
@@ -280,7 +357,7 @@ class SentinelAPI:
             Products returned by the query as a dictionary with the product ID as the key and
             the product's attributes (a dictionary) as the value.
         """
-        query = self.format_query(start_date= start_date,end_date= end_date,data_collection= data_collection,aoi= aoi,order_by= order_by)
+        query = self.format_query(start_date= start_date,end_date= end_date,data_collection= data_collection,aoi= aoi,order_by= order_by,product_type=product_type,mode=mode,direction=direction,orbit=orbit,tileid=tileid,plevel=plevel)
         # query = self.format_query(area, date, raw, area_relation, **keywords)
 
         if query.strip() == "":
@@ -296,14 +373,26 @@ class SentinelAPI:
             query,
         )
         odata_url = "https://catalogue.dataspace.copernicus.eu/odata/v1/"
-        return self.query_call(odata_url,query=query)
+        return self.query_call_ordered_dict(odata_url,query=query)
         # formatted_order_by = _format_order_by(order_by)
         # response, count = self._load_query(query, formatted_order_by, limit, offset)
         # self.logger.info(f"Found {count:,} products")
         # return _parse_opensearch_response(response)
 
     @staticmethod
-    def format_query(start_date= None,end_date= None,data_collection= None,aoi= None,order_by= None):
+    def format_query(
+        start_date= None,
+        end_date= None,
+        data_collection= None,
+        aoi= None,
+        product_type = None,
+        mode = None,
+        direction = None,
+        orbit = None,
+        plevel = None,
+        tileid = None,
+        order_by= None,
+        ):
         """Create a OpenSearch API query string."""
         # k = f"Name eq '{data_collection}' and OData.CSC.Intersects(area=geography'SRID=4326;{aoi}) and ContentDate/Start gt {start_date}T00:00:00.000Z and ContentDate/Start lt {end_date}T00:00:00.000Z"
         pieces = []
@@ -316,14 +405,14 @@ class SentinelAPI:
                 raise(InvalidDataCollection(error_msg))
         if start_date != None:
             if correct_format_date(start_date):
-                start_date_query = f"ContentDate/Start gt {start_date}T00:00:00.000Z"
+                start_date_query = f"ContentDate/Start gt {start_date}"
                 pieces.append(start_date_query)
             else:
                 error_msg = f"The starting date inserted is not valid! {start_date} is not in the format required yyyy-mm-dd!"
                 raise(InvalidFormatDate(error_msg))
         if end_date != None:
             if correct_format_date(end_date):
-                end_date_query = f"ContentDate/Start lt {end_date}T00:00:00.000Z"
+                end_date_query = f"ContentDate/Start lt {end_date}"
                 pieces.append(end_date_query)
             else:
                 error_msg = f"The ending date inserted is not valid! {end_date} is not in the format required yyyy-mm-dd!"
@@ -335,17 +424,73 @@ class SentinelAPI:
             else:
                 error_msg = "The aoi geometry inserted is not valid!"
                 raise(InvalidAoi(error_msg))
+        if product_type != None:
+            if valid_product_type(product_type):
+                product_type_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq '{product_type}')"
+                pieces.append(product_type_query)
+            else:
+                error_msg = "The product type inserted is not valid!"
+                raise(InvalidProductType(error_msg))
+        if mode != None:
+            if valid_mode(mode):
+                mode_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'operationalMode' and att/OData.CSC.StringAttribute/Value eq '{mode}')"
+                pieces.append(mode_query)
+            else:
+                error_msg = "The mode inserted is not valid!"
+                raise(InvalidMode(error_msg))
+        if direction != None:
+            if valid_direction(direction):
+                direction_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'orbitDirection' and att/OData.CSC.StringAttribute/Value eq '{direction}')"
+                pieces.append(direction_query)
+            else:
+                error_msg = "The direction inserted is not valid!"
+                raise(InvalidDirection(error_msg))
+        if orbit != None:
+            if valid_orbit(orbit):
+                orbit_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'relativeOrbitNumber' and att/OData.CSC.IntegerAttribute/Value eq {orbit}"
+                pieces.append(orbit_query)
+            else:
+                error_msg = "The orbit inserted is not valid!"
+                raise(InvalidOrbit(error_msg))
+        if orbit != None:
+            if valid_orbit(orbit):
+                orbit_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'relativeOrbitNumber' and att/OData.CSC.IntegerAttribute/Value eq {orbit}"
+                pieces.append(orbit_query)
+            else:
+                error_msg = "The orbit inserted is not valid!"
+                raise(InvalidOrbit(error_msg))
+        if plevel != None:
+            if valid_plevel(plevel):
+                plevel_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'processingLevel' and att/OData.CSC.StringAttribute/Value eq '{plevel}')"
+                pieces.append(plevel_query)
+            else:
+                error_msg = "The plevel inserted is not valid!"
+                raise(InvalidPLevel(error_msg))
+        if tileid != None:
+            if valid_tileId(tileid):
+                tileId_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'tileId' and att/OData.CSC.StringAttribute/Value eq '{tileid}'"
+                pieces.append(tileId_query)
+            else:
+                error_msg = "The tileId by inserted is not valid!"
+                raise(InvalidTileId(error_msg))    
         if order_by != None:
             if valid_order_by(order_by):
-                order_by_query = f""
+                order_by_query = f"&$orderby=ContentDate/Start {order_by}"
                 pieces.append(order_by_query)
             else:
-                error_msg = "The order by inserted is not valid!"
+                error_msg = "The order_by by inserted is not valid!"
                 raise(InvalidOrderBy(error_msg))
+        else:
+            # always order by ascending order if nothing provided
+            order_by_query = f"&$orderby=ContentDate/Start asc"
+            pieces.append(order_by_query)
         full_query = "Products?"
         for i in range(len(pieces)):
             full_query+= pieces[i]
-            if i!= len(pieces)-1:
+            if i == len(pieces)-2 and valid_order_by(order_by):
+                #order by query doen't need the "and"  
+                pass
+            elif i!= len(pieces)-1:
                 full_query+= " and "
         return full_query
     
@@ -362,101 +507,117 @@ class SentinelAPI:
             df = self.to_dataframe(json_)
             return df
     
+    def query_call_ordered_dict(self,url=None,query=None)-> OrderedDict:
+        total_url = url
+        print(f"{url}{query}")
+        if query!= None:
+            total_url += query
+        json_ = requests.get(f"{url}{query}").json()
+        if 'value' in json_:
+            import json
+            string_value = json.dumps(json_['value'])
+            return json.JSONDecoder(object_pairs_hook=OrderedDict).decode(string_value)
+        else:
+            import json
+            string_value = json.dumps(json_)
+            return json.JSONDecoder(object_pairs_hook=OrderedDict).decode(string_value)
+
+    
     def json_query_call(self,url):
         json_ = requests.get(f"{url}").json()
         return json_
 
 
-    def count(self, area=None, date=None, raw=None, area_relation="Intersects", **keywords):
-        """Get the number of products matching a query.
+    # def count(self, area=None, date=None, raw=None, area_relation="Intersects", **keywords):
+    #     """Get the number of products matching a query.
 
-        Accepted parameters are identical to :meth:`SentinelAPI.query()`.
+    #     Accepted parameters are identical to :meth:`SentinelAPI.query()`.
 
-        This is a significantly more efficient alternative to doing `len(api.query())`,
-        which can take minutes to run for queries matching thousands of products.
+    #     This is a significantly more efficient alternative to doing `len(api.query())`,
+    #     which can take minutes to run for queries matching thousands of products.
 
-        Returns
-        -------
-        int
-            The number of products matching a query.
-        """
-        for kw in ["order_by", "limit", "offset"]:
-            # Allow these function arguments to be included for compatibility with query(),
-            # but ignore them.
-            if kw in keywords:
-                del keywords[kw]
-        query = self.format_query(area, date, raw, area_relation, **keywords)
-        _, total_count = self._load_query(query, limit=0)
-        return total_count
+    #     Returns
+    #     -------
+    #     int
+    #         The number of products matching a query.
+    #     """
+    #     for kw in ["order_by", "limit", "offset"]:
+    #         # Allow these function arguments to be included for compatibility with query(),
+    #         # but ignore them.
+    #         if kw in keywords:
+    #             del keywords[kw]
+    #     query = self.format_query(area, date, raw, area_relation, **keywords)
+    #     _, total_count = self._load_query(query, limit=0)
+    #     return total_count
 
-    def _load_query(self, query, order_by=None, limit=None, offset=0):
-        products, count = self._load_subquery(query, order_by, limit, offset)
+    # def _load_query(self, query, order_by=None, limit=None, offset=0):
+    #     products, count = self._load_subquery(query, order_by, limit, offset)
 
-        # repeat query until all results have been loaded
-        max_offset = count
-        if limit is not None:
-            max_offset = min(count, offset + limit)
-        if max_offset > offset + self.page_size:
-            progress = self._tqdm(
-                desc="Querying products",
-                initial=self.page_size,
-                total=max_offset - offset,
-                unit="product",
-            )
-            for new_offset in range(offset + self.page_size, max_offset, self.page_size):
-                new_limit = limit
-                if limit is not None:
-                    new_limit = limit - new_offset + offset
-                ret = self._load_subquery(query, order_by, new_limit, new_offset)[0]
-                progress.update(len(ret))
-                products += ret
-            progress.close()
+    #     # repeat query until all results have been loaded
+    #     max_offset = count
+    #     if limit is not None:
+    #         max_offset = min(count, offset + limit)
+    #     if max_offset > offset + self.page_size:
+    #         progress = self._tqdm(
+    #             desc="Querying products",
+    #             initial=self.page_size,
+    #             total=max_offset - offset,
+    #             unit="product",
+    #         )
+    #         for new_offset in range(offset + self.page_size, max_offset, self.page_size):
+    #             new_limit = limit
+    #             if limit is not None:
+    #                 new_limit = limit - new_offset + offset
+    #             ret = self._load_subquery(query, order_by, new_limit, new_offset)[0]
+    #             progress.update(len(ret))
+    #             products += ret
+    #         progress.close()
 
-        return products, count
+    #     return products, count
 
-    def _load_subquery(self, query, order_by=None, limit=None, offset=0):
-        # store last query (for testing)
-        self._last_query = query
-        self.logger.debug("Sub-query: offset=%s, limit=%s", offset, limit)
+    # def _load_subquery(self, query, order_by=None, limit=None, offset=0):
+    #     # store last query (for testing)
+    #     self._last_query = query
+    #     self.logger.debug("Sub-query: offset=%s, limit=%s", offset, limit)
 
-        # load query results
-        url = self._format_url(order_by, limit, offset)
-        # Unlike POST, DHuS only accepts latin1 charset in the GET params
-        with self.dl_limit_semaphore:
-            response = self.session.get(url, params={"q": query.encode("latin1")})
-        self._check_scihub_response(response, query_string=query)
+    #     # load query results
+    #     url = self._format_url(order_by, limit, offset)
+    #     # Unlike POST, DHuS only accepts latin1 charset in the GET params
+    #     with self.dl_limit_semaphore:
+    #         response = self.session.get(url, params={"q": query.encode("latin1")})
+    #     self._check_scihub_response(response, query_string=query)
 
-        # store last status code (for testing)
-        self._last_response = response
+    #     # store last status code (for testing)
+    #     self._last_response = response
 
-        # parse response content
-        try:
-            json_feed = response.json()["feed"]
-            if "error" in json_feed:
-                message = json_feed["error"]["message"]
-                message = message.replace("org.apache.solr.search.SyntaxError: ", "")
-                raise QuerySyntaxError(message, response)
-            total_results = int(json_feed["opensearch:totalResults"])
-        except (ValueError, KeyError):
-            raise ServerError("API response not valid. JSON decoding failed.", response)
+    #     # parse response content
+    #     try:
+    #         json_feed = response.json()["feed"]
+    #         if "error" in json_feed:
+    #             message = json_feed["error"]["message"]
+    #             message = message.replace("org.apache.solr.search.SyntaxError: ", "")
+    #             raise QuerySyntaxError(message, response)
+    #         total_results = int(json_feed["opensearch:totalResults"])
+    #     except (ValueError, KeyError):
+    #         raise ServerError("API response not valid. JSON decoding failed.", response)
 
-        products = json_feed.get("entry", [])
-        # this verification is necessary because if the query returns only
-        # one product, self.products will be a dict not a list
-        if isinstance(products, dict):
-            products = [products]
+    #     products = json_feed.get("entry", [])
+    #     # this verification is necessary because if the query returns only
+    #     # one product, self.products will be a dict not a list
+    #     if isinstance(products, dict):
+    #         products = [products]
 
-        return products, total_results
+    #     return products, total_results
 
-    def _format_url(self, order_by=None, limit=None, offset=0):
-        if limit is None:
-            limit = self.page_size
-        limit = min(limit, self.page_size)
-        url = "search?format=json&rows={}".format(limit)
-        url += "&start={}".format(offset)
-        if order_by:
-            url += "&orderby={}".format(order_by)
-        return urljoin(self.api_url, url)
+    # def _format_url(self, order_by=None, limit=None, offset=0):
+    #     if limit is None:
+    #         limit = self.page_size
+    #     limit = min(limit, self.page_size)
+    #     url = "search?format=json&rows={}".format(limit)
+    #     url += "&start={}".format(offset)
+    #     if order_by:
+    #         url += "&orderby={}".format(order_by)
+    #     return urljoin(self.api_url, url)
 
     @staticmethod
     def to_geojson(products):
@@ -488,6 +649,15 @@ class SentinelAPI:
             raise ImportError("to_dataframe requires the optional dependency Pandas.")
 
         return pd.DataFrame.from_dict(products)
+    
+    @staticmethod
+    def from_oreded_dict_to_dataframe(products):
+        # try:
+        import json
+        od2 = json.loads(json.dumps(products))
+        # except Exception as e:
+        #     raise Exception(e)
+        return SentinelAPI.to_dataframe(od2)
 
     @staticmethod
     def to_geodataframe(products):
@@ -559,39 +729,39 @@ class SentinelAPI:
         # values["quicklook_url"] = self._get_odata_url(id, "/Products('Quicklook')/$value")
         return products
 
-    def is_online(self, id):
-        """Returns whether a product is online
+    # def is_online(self, id):
+    #     """Returns whether a product is online
 
-        Parameters
-        ----------
-        id : string
-            UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
+    #     Parameters
+    #     ----------
+    #     id : string
+    #         UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
 
-        Returns
-        -------
-        bool
-            True if online, False if in LTA
+    #     Returns
+    #     -------
+    #     bool
+    #         True if online, False if in LTA
 
-        See Also
-        --------
-        :meth:`SentinelAPI.trigger_offline_retrieval()`
-        """
-        # Check https://scihub.copernicus.eu/userguide/ODataAPI#Products_entity for more information
+    #     See Also
+    #     --------
+    #     :meth:`SentinelAPI.trigger_offline_retrieval()`
+    #     """
+    #     # Check https://scihub.copernicus.eu/userguide/ODataAPI#Products_entity for more information
 
-        if not self._online_attribute_used:
-            return True
-        url = self._get_odata_url(id, "/Online/$value")
-        with self.dl_limit_semaphore:
-            r = self.session.get(url)
-        try:
-            self._check_scihub_response(r)
-        except ServerError as e:
-            # Handle DHuS versions that do not set the Online attribute
-            if "Could not find property with name: 'Online'" in e.msg:
-                self._online_attribute_used = False
-                return True
-            raise
-        return r.json()
+    #     if not self._online_attribute_used:
+    #         return True
+    #     url = self._get_odata_url(id, "/Online/$value")
+    #     with self.dl_limit_semaphore:
+    #         r = self.session.get(url)
+    #     try:
+    #         self._check_scihub_response(r)
+    #     except ServerError as e:
+    #         # Handle DHuS versions that do not set the Online attribute
+    #         if "Could not find property with name: 'Online'" in e.msg:
+    #             self._online_attribute_used = False
+    #             return True
+    #         raise
+    #     return r.json()
 
     def download(self, id, directory_path=".", checksum=True, nodefilter=None):
         """Download a product.
@@ -642,34 +812,34 @@ class SentinelAPI:
         filename = filename.replace(".SEN3", ".zip")
         return filename
 
-    def trigger_offline_retrieval(self, uuid):
-        """Triggers retrieval of an offline product from the Long Term Archive.
+    # def trigger_offline_retrieval(self, uuid):
+    #     """Triggers retrieval of an offline product from the Long Term Archive.
 
-        Parameters
-        ----------
-        uuid : string
-            UUID of the product
+    #     Parameters
+    #     ----------
+    #     uuid : string
+    #         UUID of the product
 
-        Returns
-        -------
-        bool
-            True, if the product retrieval was successfully triggered.
-            False, if the product is already online.
+    #     Returns
+    #     -------
+    #     bool
+    #         True, if the product retrieval was successfully triggered.
+    #         False, if the product is already online.
 
-        Raises
-        ------
-        LTAError
-            If the request was not accepted due to exceeded user quota or server overload.
-        ServerError
-            If an unexpected response was received from server.
-        UnauthorizedError
-            If the provided credentials were invalid.
+    #     Raises
+    #     ------
+    #     LTAError
+    #         If the request was not accepted due to exceeded user quota or server overload.
+    #     ServerError
+    #         If an unexpected response was received from server.
+    #     UnauthorizedError
+    #         If the provided credentials were invalid.
 
-        Notes
-        -----
-        https://scihub.copernicus.eu/userguide/LongTermArchive
-        """
-        return self.downloader.trigger_offline_retrieval(uuid)
+    #     Notes
+    #     -----
+    #     https://scihub.copernicus.eu/userguide/LongTermArchive
+    #     """
+    #     return self.downloader.trigger_offline_retrieval(uuid)
 
     def download_all(
         self,
@@ -765,58 +935,58 @@ class SentinelAPI:
         ResultTuple = namedtuple("ResultTuple", ["downloaded", "retrieval_triggered", "failed"])
         return ResultTuple(downloaded_prods, retrieval_triggered, failed_prods)
 
-    def download_all_quicklooks(self, products, directory_path=".", n_concurrent_dl=4):
-        """Download quicklook for a list of products.
+    # def download_all_quicklooks(self, products, directory_path=".", n_concurrent_dl=4):
+    #     """Download quicklook for a list of products.
 
-        Takes a dict of product IDs: product data as input. This means that the return value of
-        query() can be passed directly to this method.
+    #     Takes a dict of product IDs: product data as input. This means that the return value of
+    #     query() can be passed directly to this method.
 
-        File names on the server are used for the downloaded images, e.g.
-        "S2A_MSIL1C_20200924T104031_N0209_R008_T35WMV_20200926T135405.jpeg".
+    #     File names on the server are used for the downloaded images, e.g.
+    #     "S2A_MSIL1C_20200924T104031_N0209_R008_T35WMV_20200926T135405.jpeg".
 
-        Parameters
-        ----------
-        products : dict
-            Dict of product IDs, product data
-        directory_path : string
-            Directory where the downloaded images will be downloaded
-        n_concurrent_dl : integer
-            Number of concurrent downloads
+    #     Parameters
+    #     ----------
+    #     products : dict
+    #         Dict of product IDs, product data
+    #     directory_path : string
+    #         Directory where the downloaded images will be downloaded
+    #     n_concurrent_dl : integer
+    #         Number of concurrent downloads
 
-        Returns
-        -------
-        dict[string, dict]
-            A dictionary containing the return value from download_quicklook() for each
-            successfully downloaded quicklook
-        dict[string, dict]
-            A dictionary containing the error of products where either
-            quicklook was not available or it had an unexpected content type
-        """
-        downloader = copy(self.downloader)
-        downloader.n_concurrent_dl = n_concurrent_dl
-        return downloader.download_all_quicklooks(products, directory_path)
+    #     Returns
+    #     -------
+    #     dict[string, dict]
+    #         A dictionary containing the return value from download_quicklook() for each
+    #         successfully downloaded quicklook
+    #     dict[string, dict]
+    #         A dictionary containing the error of products where either
+    #         quicklook was not available or it had an unexpected content type
+    #     """
+    #     downloader = copy(self.downloader)
+    #     downloader.n_concurrent_dl = n_concurrent_dl
+    #     return downloader.download_all_quicklooks(products, directory_path)
 
-    def download_quicklook(self, id, directory_path="."):
-        """Download a quicklook for a product.
+    # def download_quicklook(self, id, directory_path="."):
+    #     """Download a quicklook for a product.
 
-        Uses the filename on the server for the downloaded image name, e.g.
-        "S1A_EW_GRDH_1SDH_20141003T003840_20141003T003920_002658_002F54_4DD1.jpeg".
+    #     Uses the filename on the server for the downloaded image name, e.g.
+    #     "S1A_EW_GRDH_1SDH_20141003T003840_20141003T003920_002658_002F54_4DD1.jpeg".
 
-        Already downloaded images are skipped.
+    #     Already downloaded images are skipped.
 
-        Parameters
-        ----------
-        id : string
-            UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
-        directory_path : string, optional
-            Where the image will be downloaded
+    #     Parameters
+    #     ----------
+    #     id : string
+    #         UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
+    #     directory_path : string, optional
+    #         Where the image will be downloaded
 
-        Returns
-        -------
-        quicklook_info : dict
-            Dictionary containing the quicklooks's response headers as well as the path on disk.
-        """
-        return self.downloader.download_quicklook(id, directory_path)
+    #     Returns
+    #     -------
+    #     quicklook_info : dict
+    #         Dictionary containing the quicklooks's response headers as well as the path on disk.
+    #     """
+    #     return self.downloader.download_quicklook(id, directory_path)
 
     @staticmethod
     def get_products_size(products):
@@ -833,56 +1003,56 @@ class SentinelAPI:
             size_total += size_value
         return round(size_total, 2)
 
-    @staticmethod
-    def check_query_length(query):
-        """Determine whether a query to the OpenSearch API is too long.
+    # @staticmethod
+    # def check_query_length(query):
+    #     """Determine whether a query to the OpenSearch API is too long.
 
-        The length of a query string is limited to approximately 3898 characters but
-        any special characters (that is, not alphanumeric or -_.*) will take up more space.
+    #     The length of a query string is limited to approximately 3898 characters but
+    #     any special characters (that is, not alphanumeric or -_.*) will take up more space.
 
-        Parameters
-        ----------
-        query : str
-            The query string
+    #     Parameters
+    #     ----------
+    #     query : str
+    #         The query string
 
-        Returns
-        -------
-        float
-            Ratio of the query length to the maximum length
-        """
-        # The server uses the Java's URLEncoder implementation internally, which we are replicating here
-        effective_length = len(quote_plus(query, safe="-_.*").replace("~", "%7E"))
+    #     Returns
+    #     -------
+    #     float
+    #         Ratio of the query length to the maximum length
+    #     """
+    #     # The server uses the Java's URLEncoder implementation internally, which we are replicating here
+    #     effective_length = len(quote_plus(query, safe="-_.*").replace("~", "%7E"))
 
-        return effective_length / 3898
+    #     return effective_length / 3898
 
-    def _query_names(self, names):
-        """Find products by their names, e.g.
-        S1A_EW_GRDH_1SDH_20141003T003840_20141003T003920_002658_002F54_4DD1.
+    # def _query_names(self, names):
+    #     """Find products by their names, e.g.
+    #     S1A_EW_GRDH_1SDH_20141003T003840_20141003T003920_002658_002F54_4DD1.
 
-        Note that duplicates exist on server, so multiple products can be returned for each name.
+    #     Note that duplicates exist on server, so multiple products can be returned for each name.
 
-        Parameters
-        ----------
-        names : list[string]
-            List of product names.
+    #     Parameters
+    #     ----------
+    #     names : list[string]
+    #         List of product names.
 
-        Returns
-        -------
-        dict[string, dict[str, dict]]
-            A dictionary mapping each name to a dictionary which contains the products with
-            that name (with ID as the key).
-        """
-        products = {}
-        for name in names:
-            products.update(self.query(identifier=name))
+    #     Returns
+    #     -------
+    #     dict[string, dict[str, dict]]
+    #         A dictionary mapping each name to a dictionary which contains the products with
+    #         that name (with ID as the key).
+    #     """
+    #     products = {}
+    #     for name in names:
+    #         products.update(self.query(identifier=name))
 
-        # Group the products
-        output = OrderedDict((name, dict()) for name in names)
-        for id, metadata in products.items():
-            name = metadata["identifier"]
-            output[name][id] = metadata
+    #     # Group the products
+    #     output = OrderedDict((name, dict()) for name in names)
+    #     for id, metadata in products.items():
+    #         name = metadata["identifier"]
+    #         output[name][id] = metadata
 
-        return output
+    #     return output
 
     def check_files(self, paths=None, ids=None, directory=None, delete=False):
         """Verify the integrity of product files on disk.
@@ -979,14 +1149,31 @@ class SentinelAPI:
 
     def _checksum_compare(self, file_path, product_info, block_size=2**13):
         """Compare a given MD5 checksum with one calculated from a file."""
-        if "sha3-256" in product_info:
-            checksum = product_info["sha3-256"]
-            algo = hashlib.sha3_256()
-        elif "md5" in product_info:
-            checksum = product_info["md5"]
-            algo = hashlib.md5()
-        else:
-            raise InvalidChecksumError("No checksum information found in product information.")
+        if "Checksum" in product_info:
+            checksum_list = product_info['Checksum']
+            checksum = None
+            algo = None
+            if len(checksum_list) >0:
+                for checksum_dict in checksum_list:
+                    if checksum != None:
+                        break
+                    if "Algorith" in checksum_dict:
+                        algo = checksum_dict['Algorith']
+                        if algo == "sha3-256":
+                            checksum = checksum_dict['Value']
+                            algo = hashlib.sha3_256() 
+                        elif algo == "MD5":
+                            checksum = checksum_dict['Value']
+                            algo = hashlib.md5()
+                        elif algo == "BLAKE3":
+                            checksum = checksum_dict['Value']
+                            algo = hashlib.blake2b() # TODO ?
+                    else:
+                        raise InvalidChecksumError("No checksum information found in product information. No Algorithm provided provided")
+            else:
+                        raise InvalidChecksumError("No checksum information found in product information. The Checksum list is empty")
+        if checksum == None:
+            raise InvalidChecksumError("No checksum algo provided is supported.")
         file_path = Path(file_path)
         file_size = file_path.stat().st_size
         with self._tqdm(
@@ -1040,112 +1227,112 @@ class SentinelAPI:
     def _get_download_url(self, uuid):
         return self._get_odata_url(uuid, "/$value")
 
-    @staticmethod
-    def _check_scihub_response(response, test_json=True, query_string=None):
-        """Check that the response from server has status code 2xx and that the response is valid JSON."""
-        # Prevent requests from needing to guess the encoding
-        # SciHub appears to be using UTF-8 in all of their responses
-        response.encoding = "utf-8"
-        try:
-            response.raise_for_status()
-            if test_json:
-                response.json()
-        except (requests.HTTPError, ValueError):
-            msg = None
-            try:
-                msg = response.json()["error"]["message"]["value"]
-            except Exception:
-                try:
-                    msg = response.headers["cause-message"]
-                except Exception:
-                    if not response.text.lstrip().startswith("{"):
-                        try:
-                            h = html2text.HTML2Text()
-                            h.ignore_images = True
-                            h.ignore_anchors = True
-                            msg = h.handle(response.text).strip()
-                        except Exception:
-                            pass
+    # @staticmethod
+    # def _check_scihub_response(response, test_json=True, query_string=None):
+    #     """Check that the response from server has status code 2xx and that the response is valid JSON."""
+    #     # Prevent requests from needing to guess the encoding
+    #     # SciHub appears to be using UTF-8 in all of their responses
+    #     response.encoding = "utf-8"
+    #     try:
+    #         response.raise_for_status()
+    #         if test_json:
+    #             response.json()
+    #     except (requests.HTTPError, ValueError):
+    #         msg = None
+    #         try:
+    #             msg = response.json()["error"]["message"]["value"]
+    #         except Exception:
+    #             try:
+    #                 msg = response.headers["cause-message"]
+    #             except Exception:
+    #                 if not response.text.lstrip().startswith("{"):
+    #                     try:
+    #                         h = html2text.HTML2Text()
+    #                         h.ignore_images = True
+    #                         h.ignore_anchors = True
+    #                         msg = h.handle(response.text).strip()
+    #                     except Exception:
+    #                         pass
 
-            if msg is None:
-                raise ServerError("Invalid API response", response)
-            elif response.status_code == 401:
-                msg = "Invalid user name or password"
-                if "apihub.copernicus.eu/apihub" in response.url:
-                    msg += (
-                        ". Note that account creation and password changes may take up to a week "
-                        "to propagate to the 'https://apihub.copernicus.eu/apihub/' API URL you are using. "
-                        "Consider switching to 'https://scihub.copernicus.eu/dhus/' instead in the mean time."
-                    )
-                raise UnauthorizedError(msg, response)
-            elif "Request Entity Too Large" in msg or "Request-URI Too Long" in msg:
-                msg = "Server was unable to process the query due to its excessive length"
-                if query_string is not None:
-                    length = SentinelAPI.check_query_length(query_string)
-                    msg += (
-                        " (approximately {:.3}x times the maximum allowed). "
-                        "Consider using SentinelAPI.check_query_length() for "
-                        "client-side validation of the query string length.".format(length)
-                    )
-                raise QueryLengthError(msg, response) from None
-            elif "Invalid key" in msg:
-                msg = msg.split(" : ", 1)[-1]
-                raise InvalidKeyError(msg, response)
-            elif 500 <= response.status_code < 600 or msg:
-                # 5xx: Server Error
-                raise ServerError(msg, response)
-            else:
-                raise SentinelAPIError(msg, response)
+    #         if msg is None:
+    #             raise ServerError("Invalid API response", response)
+    #         elif response.status_code == 401:
+    #             msg = "Invalid user name or password"
+    #             if "apihub.copernicus.eu/apihub" in response.url:
+    #                 msg += (
+    #                     ". Note that account creation and password changes may take up to a week "
+    #                     "to propagate to the 'https://apihub.copernicus.eu/apihub/' API URL you are using. "
+    #                     "Consider switching to 'https://scihub.copernicus.eu/dhus/' instead in the mean time."
+    #                 )
+    #             raise UnauthorizedError(msg, response)
+    #         elif "Request Entity Too Large" in msg or "Request-URI Too Long" in msg:
+    #             msg = "Server was unable to process the query due to its excessive length"
+    #             if query_string is not None:
+    #                 length = SentinelAPI.check_query_length(query_string)
+    #                 msg += (
+    #                     " (approximately {:.3}x times the maximum allowed). "
+    #                     "Consider using SentinelAPI.check_query_length() for "
+    #                     "client-side validation of the query string length.".format(length)
+    #                 )
+    #             raise QueryLengthError(msg, response) from None
+    #         elif "Invalid key" in msg:
+    #             msg = msg.split(" : ", 1)[-1]
+    #             raise InvalidKeyError(msg, response)
+    #         elif 500 <= response.status_code < 600 or msg:
+    #             # 5xx: Server Error
+    #             raise ServerError(msg, response)
+    #         else:
+    #             raise SentinelAPIError(msg, response)
 
-    def _path_to_url(self, product_info, path, urltype=None):
-        id = product_info["id"]
-        root_dir = product_info["product_root_dir"]
-        path = "/".join(["Nodes('{}')".format(item) for item in path.split("/")])
-        if urltype == "value":
-            urltype = "/$value"
-        elif urltype == "json":
-            urltype = "?$format=json"
-        elif urltype == "full":
-            urltype = "?$format=json&$expand=Attributes"
-        elif urltype is None:
-            urltype = ""
-        # else: pass urltype as is
-        return self._get_odata_url(id, f"/Nodes('{root_dir}')/{path}{urltype}")
+    # def _path_to_url(self, product_info, path, urltype=None):
+    #     id = product_info["id"]
+    #     root_dir = product_info["product_root_dir"]
+    #     path = "/".join(["Nodes('{}')".format(item) for item in path.split("/")])
+    #     if urltype == "value":
+    #         urltype = "/$value"
+    #     elif urltype == "json":
+    #         urltype = "?$format=json"
+    #     elif urltype == "full":
+    #         urltype = "?$format=json&$expand=Attributes"
+    #     elif urltype is None:
+    #         urltype = ""
+    #     # else: pass urltype as is
+    #     return self._get_odata_url(id, f"/Nodes('{root_dir}')/{path}{urltype}")
 
-    def _get_manifest(self, product_info, path=None):
-        path = Path(path) if path else None
-        manifest_name = product_info["manifest_name"]
-        url = self._path_to_url(product_info, manifest_name, "value")
-        node_info = product_info.copy()
-        node_info["url"] = url
-        node_info["node_path"] = f"./{manifest_name}"
-        del node_info["md5"]
+    # def _get_manifest(self, product_info, path=None):
+    #     path = Path(path) if path else None
+    #     manifest_name = product_info["manifest_name"]
+    #     url = self._path_to_url(product_info, manifest_name, "value")
+    #     node_info = product_info.copy()
+    #     node_info["url"] = url
+    #     node_info["node_path"] = f"./{manifest_name}"
+    #     del node_info["md5"]
 
-        if path and path.exists():
-            self.logger.debug("Manifest file already available (%s), skipping download", path)
-            data = path.read_bytes()
-            node_info["size"] = len(data)
-            return node_info, data
+    #     if path and path.exists():
+    #         self.logger.debug("Manifest file already available (%s), skipping download", path)
+    #         data = path.read_bytes()
+    #         node_info["size"] = len(data)
+    #         return node_info, data
 
-        url = self._path_to_url(product_info, manifest_name, "json")
-        with self.dl_limit_semaphore:
-            response = self.session.get(url)
-        self._check_scihub_response(response)
-        info = response.json()["d"]
+    #     url = self._path_to_url(product_info, manifest_name, "json")
+    #     with self.dl_limit_semaphore:
+    #         response = self.session.get(url)
+    #     self._check_scihub_response(response)
+    #     info = response.json()["d"]
 
-        node_info["size"] = int(info["ContentLength"])
-        with self.dl_limit_semaphore:
-            response = self.session.get(node_info["url"])
-        self._check_scihub_response(response, test_json=False)
-        data = response.content
-        if len(data) != node_info["size"]:
-            raise SentinelAPIError("File corrupt: data length do not match")
+    #     node_info["size"] = int(info["ContentLength"])
+    #     with self.dl_limit_semaphore:
+    #         response = self.session.get(node_info["url"])
+    #     self._check_scihub_response(response, test_json=False)
+    #     data = response.content
+    #     if len(data) != node_info["size"]:
+    #         raise SentinelAPIError("File corrupt: data length do not match")
 
-        if path:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(data)
+    #     if path:
+    #         path.parent.mkdir(parents=True, exist_ok=True)
+    #         path.write_bytes(data)
 
-        return node_info, data
+    #     return node_info, data
 
 
 def read_geojson(geojson_file):
