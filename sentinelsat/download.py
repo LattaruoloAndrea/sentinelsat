@@ -307,60 +307,10 @@ class Downloader:
                 # dl_tasks[future] = pid
         except Exception as e:
             raise(Exception(f"Error during downloading! {e}"))
+        finally:
+            dl_executor.shutdown(wait=True)
+            dl_progress.close()
         return ResultTuple(statuses, {}, {})
-        #     for task in concurrent.futures.as_completed(list(trigger_tasks) + list(dl_tasks)):
-        #         pid = trigger_tasks.get(task) or dl_tasks[task]
-        #         exception = exceptions.get(pid)
-        #         if task.cancelled():
-        #             exception = concurrent.futures.CancelledError()
-        #         if task.exception():
-        #             exception = task.exception()
-
-        #         if task in dl_tasks:
-        #             if not exception:
-        #                 product_infos[pid] = task.result()
-        #                 statuses[pid] = DownloadStatus.DOWNLOADED
-        #             dl_progress.update()
-        #             # Keep the LTA progress fresh
-        #             if offline_prods:
-        #                 trigger_progress.update(0)
-        #         else:
-        #             trigger_progress.update()
-        #             if all(t.done() for t in trigger_tasks):
-        #                 trigger_progress.close()
-
-        #         if exception:
-        #             exceptions[pid] = exception
-        #             if self.fail_fast:
-        #                 raise exception from None
-        #             else:
-        #                 self.logger.error("%s failed: %s", pid, _format_exception(exception))
-        # except:
-        #     stop_event.set()
-        #     for t in list(trigger_tasks) + list(dl_tasks):
-        #         t.cancel()
-        #     raise
-        # finally:
-        #     dl_executor.shutdown()
-        #     dl_progress.close()
-        #     if offline_prods:
-        #         trigger_executor.shutdown()
-        #         trigger_progress.close()
-
-        # if not any(statuses):
-        #     if not exceptions:
-        #         raise SentinelAPIError("Downloading all products failed for an unknown reason")
-        #     exception = list(exceptions)[0]
-        #     raise exception
-
-        # # Update Online status in product_infos
-        # for pid, status in statuses.items():
-        #     if status in [DownloadStatus.OFFLINE, DownloadStatus.TRIGGERED]:
-        #         product_infos[pid]["Online"] = False
-        #     elif status != DownloadStatus.UNAVAILABLE:
-        #         product_infos[pid]["Online"] = True
-
-        # return ResultTuple(statuses, exceptions, product_infos)
 
     def _init_statuses(self, product_ids,products):
         # print(product_ids)
@@ -376,12 +326,27 @@ class Downloader:
     def _skip_existing_products(self, directory, products, statuses):
         for index,row in products.iterrows():
             pid = row['Id']
-            filename = row['Name']
+            # filename = row['Name']
+            filename = self.api._get_filename(row)
             path = Path(directory) / filename
+            ff = filename+".incomplete"
+            path_incomplete = Path(directory) /ff
+            print(path_incomplete)
             if path.exists():
                 self.logger.info("Skipping already downloaded %s.", filename)
                 statuses[pid] = DownloadStatus.DOWNLOADED
                 products.drop([index])
+            if path_incomplete.exists():
+                #TODO when metadata working delete this part delete for now the already downloaded part
+                import os
+                # print(f"Before removal {path_incomplete}...")
+                os.remove(path_incomplete)
+                # print(f"After removal {path_incomplete}...")
+                if path.exists():
+                    # print(f"Before removal {path}...")
+                    os.remove(path)
+                    # print(f"After removal {path}...")
+                print(f"file: {path_incomplete} deleted!")
         return products     
 
     # def trigger_offline_retrieval(self, uuid):
@@ -676,6 +641,7 @@ class Downloader:
         # self.api.session.get(url, stream=True, headers=headers)
         with self.api.dl_limit_semaphore:
             print("GETTING DOWNLOAD",self.api.dl_limit_semaphore._value)
+            self.api.if_token_expired_refresh()
             import requests
             r = requests.get(url, stream=True, headers=headers)
         with self._tqdm(

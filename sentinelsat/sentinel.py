@@ -419,7 +419,7 @@ class SentinelAPI:
                 raise(InvalidFormatDate(error_msg))
         if aoi!= None:
             if valid_aoi(aoi):
-                aoi_query = f"OData.CSC.Intersects(area=geography'SRID=4326;{aoi})"
+                aoi_query = f"OData.CSC.Intersects(area=geography'SRID=4326;{aoi}')"
                 pieces.append(aoi_query)
             else:
                 error_msg = "The aoi geometry inserted is not valid!"
@@ -447,14 +447,7 @@ class SentinelAPI:
                 raise(InvalidDirection(error_msg))
         if orbit != None:
             if valid_orbit(orbit):
-                orbit_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'relativeOrbitNumber' and att/OData.CSC.IntegerAttribute/Value eq {orbit}"
-                pieces.append(orbit_query)
-            else:
-                error_msg = "The orbit inserted is not valid!"
-                raise(InvalidOrbit(error_msg))
-        if orbit != None:
-            if valid_orbit(orbit):
-                orbit_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'relativeOrbitNumber' and att/OData.CSC.IntegerAttribute/Value eq {orbit}"
+                orbit_query = f"Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'relativeOrbitNumber' and att/OData.CSC.IntegerAttribute/Value eq {orbit})"
                 pieces.append(orbit_query)
             else:
                 error_msg = "The orbit inserted is not valid!"
@@ -1334,6 +1327,35 @@ class SentinelAPI:
 
     #     return node_info, data
 
+def read_collections(collection):
+    retsult = []
+    word = ""
+    level = -1
+    for i in collection:
+        if i== "(":
+            if level ==-1:
+                level = 1
+            else:
+                level+=1
+        if i == ")":
+            level-=1
+        word+= i
+        if level == 0:
+            level = -1
+            retsult.append(word)
+            word = ""
+    return retsult
+        
+
+def remove_geometry_collection(wkt: str):
+    geometry_collection = "GEOMETRYCOLLECTION(" 
+    index = wkt.find(geometry_collection)
+    all_gemometry = []
+    if index>=0:
+        wkt_ = wkt[len(geometry_collection):len(wkt)-1]
+        return wkt_
+    else:
+        return wkt
 
 def read_geojson(geojson_file):
     """Read a GeoJSON file into a GeoJSON object."""

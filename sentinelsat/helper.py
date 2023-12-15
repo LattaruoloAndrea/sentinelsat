@@ -33,7 +33,7 @@ def valid_product_type(type_: str)-> bool:
     TODO
     Check if the product_type string is a valid parameter
     """
-    if type_ == "SLC":
+    if type_ == "SLC" or type_ == "FRD" or type_ == "OCN":
         return True
     return False
 
