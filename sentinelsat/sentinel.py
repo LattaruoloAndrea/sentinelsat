@@ -200,8 +200,8 @@ class SentinelAPI:
     def if_token_expired_refresh(self):
         current_timestamp  = time.time()
         min_10_in_s = self.token_expires_in # seconds
-        if self.time_stamp_login +min_10_in_s > current_timestamp:
-            #10 minutes not passed
+        if self.time_stamp_login +min_10_in_s- (60*2) > current_timestamp:
+            #8 minutes not passed
             print("token not expired")
             pass
         else:
@@ -265,11 +265,11 @@ class SentinelAPI:
         json_ = r.json()
         return json_["access_token"],json_["refresh_token"],json_["expires_in"],json_["refresh_expires_in"]
 
-    def verify_token(self):
-        while True:
-            time.sleep(60) # sleep for 1 minutes
-            print("Verify token")
-            self.if_token_expired_refresh()
+    # def verify_token(self):
+    #     while True:
+    #         time.sleep(60) # sleep for 1 minutes
+    #         print("Verify token")
+    #         self.if_token_expired_refresh()
 
     def query_sentinel_1(self,start_date,end_date,point,direction=None,orbit=None):
         return self.query(start_date=start_date,end_date=end_date,order_by='asc',data_collection='SENTINEL-1',product_type='SLC',mode='IW',aoi=point,direction=direction,orbit=orbit)
@@ -519,98 +519,6 @@ class SentinelAPI:
     def json_query_call(self,url):
         json_ = requests.get(f"{url}").json()
         return json_
-
-
-    # def count(self, area=None, date=None, raw=None, area_relation="Intersects", **keywords):
-    #     """Get the number of products matching a query.
-
-    #     Accepted parameters are identical to :meth:`SentinelAPI.query()`.
-
-    #     This is a significantly more efficient alternative to doing `len(api.query())`,
-    #     which can take minutes to run for queries matching thousands of products.
-
-    #     Returns
-    #     -------
-    #     int
-    #         The number of products matching a query.
-    #     """
-    #     for kw in ["order_by", "limit", "offset"]:
-    #         # Allow these function arguments to be included for compatibility with query(),
-    #         # but ignore them.
-    #         if kw in keywords:
-    #             del keywords[kw]
-    #     query = self.format_query(area, date, raw, area_relation, **keywords)
-    #     _, total_count = self._load_query(query, limit=0)
-    #     return total_count
-
-    # def _load_query(self, query, order_by=None, limit=None, offset=0):
-    #     products, count = self._load_subquery(query, order_by, limit, offset)
-
-    #     # repeat query until all results have been loaded
-    #     max_offset = count
-    #     if limit is not None:
-    #         max_offset = min(count, offset + limit)
-    #     if max_offset > offset + self.page_size:
-    #         progress = self._tqdm(
-    #             desc="Querying products",
-    #             initial=self.page_size,
-    #             total=max_offset - offset,
-    #             unit="product",
-    #         )
-    #         for new_offset in range(offset + self.page_size, max_offset, self.page_size):
-    #             new_limit = limit
-    #             if limit is not None:
-    #                 new_limit = limit - new_offset + offset
-    #             ret = self._load_subquery(query, order_by, new_limit, new_offset)[0]
-    #             progress.update(len(ret))
-    #             products += ret
-    #         progress.close()
-
-    #     return products, count
-
-    # def _load_subquery(self, query, order_by=None, limit=None, offset=0):
-    #     # store last query (for testing)
-    #     self._last_query = query
-    #     self.logger.debug("Sub-query: offset=%s, limit=%s", offset, limit)
-
-    #     # load query results
-    #     url = self._format_url(order_by, limit, offset)
-    #     # Unlike POST, DHuS only accepts latin1 charset in the GET params
-    #     with self.dl_limit_semaphore:
-    #         response = self.session.get(url, params={"q": query.encode("latin1")})
-    #     self._check_scihub_response(response, query_string=query)
-
-    #     # store last status code (for testing)
-    #     self._last_response = response
-
-    #     # parse response content
-    #     try:
-    #         json_feed = response.json()["feed"]
-    #         if "error" in json_feed:
-    #             message = json_feed["error"]["message"]
-    #             message = message.replace("org.apache.solr.search.SyntaxError: ", "")
-    #             raise QuerySyntaxError(message, response)
-    #         total_results = int(json_feed["opensearch:totalResults"])
-    #     except (ValueError, KeyError):
-    #         raise ServerError("API response not valid. JSON decoding failed.", response)
-
-    #     products = json_feed.get("entry", [])
-    #     # this verification is necessary because if the query returns only
-    #     # one product, self.products will be a dict not a list
-    #     if isinstance(products, dict):
-    #         products = [products]
-
-    #     return products, total_results
-
-    # def _format_url(self, order_by=None, limit=None, offset=0):
-    #     if limit is None:
-    #         limit = self.page_size
-    #     limit = min(limit, self.page_size)
-    #     url = "search?format=json&rows={}".format(limit)
-    #     url += "&start={}".format(offset)
-    #     if order_by:
-    #         url += "&orderby={}".format(order_by)
-    #     return urljoin(self.api_url, url)
 
     @staticmethod
     def to_geojson(products):
@@ -1142,22 +1050,21 @@ class SentinelAPI:
 
     def _checksum_compare(self, file_path, product_info, block_size=2**13):
         """Compare a given MD5 checksum with one calculated from a file."""
+        checksum = None
+        algo = None
         if "Checksum" in product_info:
             checksum_list = product_info['Checksum']
-            checksum = None
-            algo = None
             if len(checksum_list) >0:
                 for checksum_dict in checksum_list:
-                    if checksum != None:
-                        break
-                    if "Algorith" in checksum_dict:
-                        algo = checksum_dict['Algorith']
+                    if "Algorithm" in checksum_dict:
+                        algo = checksum_dict['Algorithm']
                         if algo == "sha3-256":
                             checksum = checksum_dict['Value']
                             algo = hashlib.sha3_256() 
                         elif algo == "MD5":
                             checksum = checksum_dict['Value']
                             algo = hashlib.md5()
+                            break
                         elif algo == "BLAKE3":
                             checksum = checksum_dict['Value']
                             algo = hashlib.blake2b() # TODO ?
@@ -1167,6 +1074,7 @@ class SentinelAPI:
                         raise InvalidChecksumError("No checksum information found in product information. The Checksum list is empty")
         if checksum == None:
             raise InvalidChecksumError("No checksum algo provided is supported.")
+        # input(f"checksum found {algo} {checksum}...")
         file_path = Path(file_path)
         file_size = file_path.stat().st_size
         with self._tqdm(

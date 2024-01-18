@@ -177,13 +177,14 @@ class Downloader:
         # Use a temporary file for downloading
 
         temp_path = path.with_name(path.name + ".incomplete")
+        print(f"DOWNLOADING: {product_info['Name']} with size {product_info['ContentLength']}")
         skip_download = False
         dont_skip_checksum_and_size_check = False # TODO when the data from the ESA will be working correctly check size and checksum 
         if dont_skip_checksum_and_size_check:
             if temp_path.exists():
                 size = temp_path.stat().st_size
-                print(f"\n\nExists temp path: {temp_path},size: {size}, info_size: {product_info['ContentLength']}\n\n")
-                input('\n\nwait for input\n\n')
+                # print(f"\n\nExists temp path: {temp_path},size: {size}, info_size: {product_info['ContentLength']}\n\n")
+                # input('\n\nwait for input\n\n')
                 if size > product_info["ContentLength"]:
                     self.logger.warning(
                         "Existing incomplete file %s is larger than the expected final size"
@@ -213,6 +214,7 @@ class Downloader:
         if not skip_download:
             # Store the number of downloaded bytes for unit tests
             print(f"First time download {temp_path}")
+            self.logger.info(f"First time download {temp_path}")
             temp_path.parent.mkdir(parents=True, exist_ok=True)
             pid = product_info['Id']
             url = f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({pid})/$value"
@@ -223,14 +225,26 @@ class Downloader:
                 path.name,
                 stop_event,
             )
-        # Check integrity with MD5 checksum
-        if dont_skip_checksum_and_size_check:
-            if self.verify_checksum is True:
-                if not self.api._checksum_compare(temp_path, product_info):
-                    temp_path.unlink()
-                    raise InvalidChecksumError("File corrupt: checksums do not match")
-        # Download successful, rename the temporary file to its proper name
-        shutil.move(temp_path, path)
+        size = temp_path.stat().st_size
+        if size > product_info["ContentLength"]:
+                self.logger.warning(
+                    "Existing incomplete file %s is larger than the expected final size"
+                    " (%s vs %s bytes). Deleting it.",
+                    str(temp_path),
+                    size,
+                    product_info["ContentLength"],
+                )
+                temp_path.unlink()
+        elif size == product_info["ContentLength"]:
+            # Check integrity with MD5 checksum
+            if self.verify_checksum and self.api._checksum_compare(temp_path, product_info):
+                # Log a warning since this should never happen
+                self.logger.warning(
+                    "Existing incomplete file %s appears to be fully downloaded and checksum valid: ",
+                    str(temp_path),
+                )
+                shutil.move(temp_path, path)
+                # temp_path.unlink()
         return product_info
 
     def download_all(self, products_dict, directory="."):
@@ -341,13 +355,13 @@ class Downloader:
                 import os
                 # print(f"Before removal {path_incomplete}...")
                 os.remove(path_incomplete)
-                # print(f"After removal {path_incomplete}...")
+                 #print(f"After removal {path_incomplete}...")
                 if path.exists():
                     # print(f"Before removal {path}...")
                     os.remove(path)
                     # print(f"After removal {path}...")
                 print(f"file: {path_incomplete} deleted!")
-        return products     
+        return products
 
     # def trigger_offline_retrieval(self, uuid):
     #     """Triggers retrieval of an offline product.
@@ -605,7 +619,7 @@ class Downloader:
                 statuses[uuid] = DownloadStatus.DOWNLOAD_STARTED
                 return self.download(uuid, directory, stop_event=stop_event)
             except (concurrent.futures.CancelledError, KeyboardInterrupt, SystemExit):
-                raise
+                raise Exception("THERE WAS AN ERROR !!!")
             except Exception as e:
                 if isinstance(e, InvalidChecksumError):
                     self.logger.warning(
@@ -627,48 +641,59 @@ class Downloader:
         raise last_exception
 
     def _download(self, url, path, file_size, title, stop_event):
-        headers = {}
-        continuing = path.exists()
-        access_token = self.api.token
-        if continuing:
-            already_downloaded_bytes = 0#TODO remove this 0 #path.stat().st_size
-            # input(f"ACCESS TOKEN: {access_token}")
-            headers = {"Authorization": f"Bearer {access_token}","Range": "bytes={}-".format(already_downloaded_bytes)}
-        else:
-            already_downloaded_bytes = 0
-            headers = {"Authorization": f"Bearer {access_token}"}
-        downloaded_bytes = 0
-        # self.api.session.get(url, stream=True, headers=headers)
-        with self.api.dl_limit_semaphore:
-            print("GETTING DOWNLOAD",self.api.dl_limit_semaphore._value)
+        try:
+            headers = {}
+            continuing = path.exists()
             self.api.if_token_expired_refresh()
-            import requests
-            r = requests.get(url, stream=True, headers=headers)
-        with self._tqdm(
-            desc=f"Downloading {title}",
-            total=file_size,
-            unit="B",
-            unit_scale=True,
-            initial=already_downloaded_bytes,
-        ) as progress, closing(r):
-            # self.api._check_scihub_response(r, test_json=False)
-            mode = "ab" if continuing else "wb"
-            with open(path, mode) as f:
-                iterator = r.iter_content(chunk_size=self.chunk_size)
-                while True:
-                    if stop_event and stop_event.is_set():
-                        raise concurrent.futures.CancelledError()
-                    try:
-                        with self.api.dl_limit_semaphore:
-                            chunk = next(iterator)
-                    except StopIteration:
-                        break
-                    if chunk:  # filter out keep-alive new chunks
-                        f.write(chunk)
-                        progress.update(len(chunk))
-                        downloaded_bytes += len(chunk)
-            # Return the number of bytes downloaded
-            return downloaded_bytes
+            access_token = self.api.token
+            if continuing:
+                already_downloaded_bytes = 0#path.stat().st_size #TODO remove this 0 #path.stat().st_size
+                print(url)
+                headers = {"Authorization": f"Bearer {access_token}","Range": "bytes={}-".format(already_downloaded_bytes)}
+                # input("????????????????????????????????????????????")
+            else:
+                already_downloaded_bytes = 0
+                headers = {"Authorization": f"Bearer {access_token}"}
+            downloaded_bytes = already_downloaded_bytes
+            # self.api.session.get(url, stream=True, headers=headers)
+            with self.api.dl_limit_semaphore:
+                print("GETTING DOWNLOAD",self.api.dl_limit_semaphore._value)
+                import requests
+                r = requests.get(url, stream=True, headers=headers)
+            with self._tqdm(
+                desc=f"Downloading {title}",
+                total=file_size,
+                unit="B",
+                unit_scale=True,
+                initial=already_downloaded_bytes,
+            ) as progress, closing(r):
+                # self.api._check_scihub_response(r, test_json=False)
+                mode = "ab" if continuing else "wb"
+                with open(path, mode) as f:
+                    for chunk in r.iter_content(chunk_size=self.chunk_size):
+                        if stop_event and stop_event.is_set():
+                            raise concurrent.futures.CancelledError()
+                        if chunk:  # filter out keep-alive new chunks
+                            f.write(chunk)
+                            progress.update(len(chunk))
+                            downloaded_bytes += len(chunk)
+                        #     finished = True
+                        # except Exception as e:
+                        #     self.api.if_token_expired_refresh()
+                        #     headers['Authorization'] = f'Bearer {self.api.token}'
+                        #     r = requests.get(url, stream=True, headers=headers)
+                        #     continue
+                # Return the number of bytes downloaded
+        except Exception as e:
+            print(f"EXCEPTION ON {url}")
+            print(e)
+            input("????????????????????????????????????????????")
+        try:
+            r.close()
+            print("CONNECTION CLOSED")
+        except:
+            print("CANNOT CLOSE")
+        return downloaded_bytes
 
     def _dataobj_to_node_info(self, dataobj_info, product_info):
         path = dataobj_info["href"]
