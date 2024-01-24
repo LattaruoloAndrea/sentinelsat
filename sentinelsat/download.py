@@ -100,7 +100,7 @@ class Downloader:
         self.lta_timeout = lta_timeout
         self.chunk_size = 2**20  # download in 1 MB chunks by default
 
-    def download(self, id, directory=".", *, stop_event=None):
+    def download(self, id, directory=".", *, stop_event=None,proxy=None):
         """Download a product.
 
         Parameters
@@ -140,77 +140,48 @@ class Downloader:
         if path.exists():
             # We assume that the product has been downloaded and is complete
             return product_info
-        self._download_common(product_info, path, stop_event)
+        self._download_common(product_info, path, stop_event,proxy)
         return product_info
 
-    # def _download_with_node_filter(self, id, directory, stop_event):
-    #     product_info = self.api.get_product_odata(id)
-    #     product_path = Path(directory) / (product_info["product_root_dir"])
-    #     product_info["node_path"] = "./" + product_info["product_root_dir"]
-    #     manifest_path = product_path / product_info["manifest_name"]
-    #     if not manifest_path.exists() and self.trigger_offline_retrieval(id):
-    #         raise LTATriggered(id)
-    #     manifest_info, _ = self.api._get_manifest(product_info, manifest_path)
-    #     product_info["nodes"] = {
-    #         manifest_info["node_path"]: manifest_info,
-    #     }
-    #     node_infos = self._filter_nodes(manifest_path, product_info, self.node_filter)
-    #     product_info["nodes"].update(node_infos)
-    #     for node_info in node_infos.values():
-    #         if stop_event and stop_event.is_set():
-    #             raise concurrent.futures.CancelledError()
-    #         node_path = node_info["node_path"]
-    #         path = (product_path / node_path).resolve()
-    #         node_info["path"] = path
-    #         node_info["downloaded_bytes"] = 0
-
-    #         self.logger.debug("Downloading %s node to %s", id, path)
-    #         self.logger.debug("Node URL for %s: %s", id, node_info["url"])
-
-    #         if path.exists():
-    #             # We assume that the product node has been downloaded and is complete
-    #             continue
-    #         self._download_common(node_info, path, stop_event)
-    #     return product_info
-
-    def _download_common(self, product_info: Dict[str, Any], path: Path, stop_event):
+    def _download_common(self, product_info: Dict[str, Any], path: Path, stop_event,proxy=None):
         # Use a temporary file for downloading
 
         temp_path = path.with_name(path.name + ".incomplete")
         print(f"DOWNLOADING: {product_info['Name']} with size {product_info['ContentLength']}")
         skip_download = False
-        dont_skip_checksum_and_size_check = False # TODO when the data from the ESA will be working correctly check size and checksum 
-        if dont_skip_checksum_and_size_check:
-            if temp_path.exists():
-                size = temp_path.stat().st_size
-                # print(f"\n\nExists temp path: {temp_path},size: {size}, info_size: {product_info['ContentLength']}\n\n")
-                # input('\n\nwait for input\n\n')
-                if size > product_info["ContentLength"]:
-                    self.logger.warning(
-                        "Existing incomplete file %s is larger than the expected final size"
-                        " (%s vs %s bytes). Deleting it.",
-                        str(temp_path),
-                        size,
-                        product_info["ContentLength"],
-                    )
-                    temp_path.unlink()
-                elif size == product_info["ContentLength"]:
-                    if self.verify_checksum and not self.api._checksum_compare(temp_path, product_info):
-                        # Log a warning since this should never happen
-                        self.logger.warning(
-                            "Existing incomplete file %s appears to be fully downloaded but "
-                            "its checksum is incorrect. Deleting it.",
-                            str(temp_path),
-                        )
-                        temp_path.unlink()
-                    else:
-                        skip_download = True
-                else:
-                    # continue downloading
-                    self.logger.info(
-                        "Download will resume from existing incomplete file %s.", temp_path
-                    )
-                    pass
+        # dont_skip_checksum_and_size_check = False # TODO when the data from the ESA will be working correctly check size and checksum 
+        # if dont_skip_checksum_and_size_check:
+        #     if temp_path.exists():
+        #         size = temp_path.stat().st_size
+        #         # print(f"\n\nExists temp path: {temp_path},size: {size}, info_size: {product_info['ContentLength']}\n\n")
+        #         # input('\n\nwait for input\n\n')
+        #         if size > product_info["ContentLength"]:
+        #             self.logger.warning(
+        #                 "Existing incomplete file %s is larger than the expected final size"
+        #                 " (%s vs %s bytes). Deleting it.",
+        #                 str(temp_path),
+        #                 size,
+        #                 product_info["ContentLength"],
+        #             )
+        #             temp_path.unlink()
+        #             raise(f"Content length mismatch for {path.name}")
+        #         elif size == product_info["ContentLength"]:
+        #             if self.verify_checksum and not self.api._checksum_compare(temp_path, product_info):
+        #                 # Log a warning since this should never happen
+        #                 self.logger.warning(
+        #                     "Existing incomplete file %s appears to be fully downloaded but "
+        #                     "its checksum is incorrect. Deleting it.",
+        #                     str(temp_path),
+        #                 )
+        #                 temp_path.unlink()
+        #             else:
+        #                 skip_download = True
+        #         else:
+        #             # continue downloading
+        #             self.logger.info(
+        #                 "Download will resume from existing incomplete file %s.", temp_path
+        #             )
+        #             pass
         if not skip_download:
             # Store the number of downloaded bytes for unit tests
             print(f"First time download {temp_path}")
@@ -224,6 +195,7 @@ class Downloader:
                 product_info["ContentLength"],
                 path.name,
                 stop_event,
+                proxy
             )
         size = temp_path.stat().st_size
         if size > product_info["ContentLength"]:
@@ -235,19 +207,28 @@ class Downloader:
                     product_info["ContentLength"],
                 )
                 temp_path.unlink()
+                raise(f"Content length mismatch for {path.name}")
         elif size == product_info["ContentLength"]:
             # Check integrity with MD5 checksum
-            if self.verify_checksum and self.api._checksum_compare(temp_path, product_info):
+            if self.verify_checksum:
                 # Log a warning since this should never happen
-                self.logger.warning(
-                    "Existing incomplete file %s appears to be fully downloaded and checksum valid: ",
-                    str(temp_path),
-                )
-                shutil.move(temp_path, path)
-                # temp_path.unlink()
+                if self.api._checksum_compare(temp_path, product_info):
+                    self.logger.warning(
+                        "Existing incomplete file %s appears to be fully downloaded and checksum valid: ",
+                        str(temp_path),
+                    )
+                    shutil.move(temp_path, path)
+                else:
+                    self.logger.warning(
+                        "Existing incomplete file %s appears to be fully downloaded but "
+                        "its checksum is incorrect. Deleting it.",
+                        str(temp_path),
+                    )
+                    temp_path.unlink()
+                    raise(f"Checksum mismatch for file {path.name}")
         return product_info
 
-    def download_all(self, products_dict, directory="."):
+    def download_all(self, products_dict, directory=".",proxy=None):
         """Download a list of products.
 
         Parameters
@@ -291,10 +272,12 @@ class Downloader:
 
         # Skip already downloaded files.
         products = self._skip_existing_products(directory, products, statuses)
+        # print(f"statuses: {statuses}")
+        # input("...")
         product_ids = list(set(products['Id']))
         stop_event = threading.Event()
-        dl_tasks = {}
-        trigger_tasks = {}
+        exceptions = {}
+        product_infos = {}
 
         # One threadpool for downloading.
         dl_count = len(product_ids)
@@ -316,7 +299,10 @@ class Downloader:
                     row['Name'],
                     directory,
                     stop_event,
-                    statuses
+                    statuses,
+                    exceptions,
+                    product_infos,
+                    proxy
                 )
                 # dl_tasks[future] = pid
         except Exception as e:
@@ -324,14 +310,14 @@ class Downloader:
         finally:
             dl_executor.shutdown(wait=True)
             dl_progress.close()
-        return ResultTuple(statuses, {}, {})
+        return ResultTuple(statuses, exceptions, product_infos)
 
     def _init_statuses(self, product_ids,products):
         # print(product_ids)
         statuses = {pid: DownloadStatus.UNAVAILABLE for pid in product_ids}
         for index,row in products.iterrows():
             pid = row['Id']
-            if row['Online'] == 'Online':
+            if row['Online']:
                 statuses[pid] = DownloadStatus.ONLINE
             else:
                 statuses[pid] = DownloadStatus.OFFLINE
@@ -352,6 +338,7 @@ class Downloader:
                 products.drop([index])
             if path_incomplete.exists():
                 #TODO when metadata working delete this part delete for now the already downloaded part
+                # statuses[pid] = DownloadStatus.DOWNLOADED_INCOMPLETE
                 import os
                 # print(f"Before removal {path_incomplete}...")
                 os.remove(path_incomplete)
@@ -362,232 +349,13 @@ class Downloader:
                     # print(f"After removal {path}...")
                 print(f"file: {path_incomplete} deleted!")
         return products
-
-    # def trigger_offline_retrieval(self, uuid):
-    #     """Triggers retrieval of an offline product.
-
-    #     Parameters
-    #     ----------
-    #     uuid : string
-    #         UUID of the product
-
-    #     Returns
-    #     -------
-    #     bool
-    #         True, if the product retrieval was successfully triggered.
-    #         False, if the product is already online.
-
-    #     Raises
-    #     ------
-    #     LTAError
-    #         If the request was not accepted due to exceeded user quota or server overload.
-    #     ServerError
-    #         If an unexpected response was received from server.
-    #     UnauthorizedError
-    #         If the provided credentials were invalid.
-
-    #     Notes
-    #     -----
-    #     https://scihub.copernicus.eu/userguide/LongTermArchive
-    #     """
-    #     # Request just a single byte to avoid accidental downloading of the whole product.
-    #     # Requesting zero bytes results in NullPointerException in the server.
-    #     with self.api.dl_limit_semaphore:
-    #         r = self.api.session.get(
-    #             self.api._get_download_url(uuid), headers={"Range": "bytes=0-1"}
-    #         )
-    #     cause = r.headers.get("cause-message")
-    #     # check https://scihub.copernicus.eu/userguide/LongTermArchive#HTTP_Status_codes
-    #     if r.status_code in (200, 206):
-    #         self.logger.debug("Product is online")
-    #         return False
-    #     elif r.status_code == 202:
-    #         self.logger.debug("Accepted for retrieval")
-    #         return True
-    #     elif r.status_code == 403 and cause and "concurrent flows" in cause:
-    #         # cause: 'An exception occured while creating a stream: Maximum number of 4 concurrent flows achieved by the user "username""'
-    #         self.logger.debug("Product is online but concurrent downloads limit was exceeded")
-    #         return False
-    #     elif r.status_code == 403:
-    #         # cause: 'User 'username' offline products retrieval quota exceeded (20 fetches max) trying to fetch product PRODUCT_FILENAME (BYTES_COUNT bytes compressed)'
-    #         msg = f"User quota exceeded: {cause}"
-    #         self.logger.error(msg)
-    #         raise LTAError(msg, r)
-    #     elif r.status_code == 503:
-    #         msg = f"Request not accepted: {cause}"
-    #         self.logger.error(msg)
-    #         raise LTAError(msg, r)
-    #     elif r.status_code < 400:
-    #         msg = f"Unexpected response {r.status_code}: {cause}"
-    #         self.logger.error(msg)
-    #         raise ServerError(msg, r)
-    #     self.api._check_scihub_response(r, test_json=False)
-
-    # def get_stream(self, id, **kwargs):
-    #     """Exposes requests response ready to stream product to e.g. S3.
-
-    #     Parameters
-    #     ----------
-    #     id : string
-    #         UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
-    #     **kwargs
-    #         Any additional parameters for :func:`requests.get()`
-
-    #     Raises
-    #     ------
-    #     LTATriggered
-    #         If the product has been archived and its retrieval was successfully triggered.
-    #     LTAError
-    #         If the product has been archived and its retrieval failed.
-
-    #     Returns
-    #     -------
-    #     requests.Response:
-    #         Opened response object
-    #     """
-    #     if not self.api.is_online(id):
-    #         self.trigger_offline_retrieval(id)
-    #         raise LTATriggered(id)
-    #     with self.api.dl_limit_semaphore:
-    #         r = self.api.session.get(self.api._get_download_url(id), stream=True, **kwargs)
-    #     self.api._check_scihub_response(r, test_json=False)
-    #     return r
-
-    # def download_quicklook(self, id, directory="."):
-    #     """Download a quicklook for a product.
-
-    #     Parameters
-    #     ----------
-    #     id : string
-    #         UUID of the product, e.g. 'a8dd0cfd-613e-45ce-868c-d79177b916ed'
-    #     directory : string or Path, optional
-    #         Where the image will be downloaded. Defaults to ".".
-
-    #     Returns
-    #     -------
-    #     quicklook_info : dict
-    #         Dictionary containing the quicklooks's response headers as well as the path on disk.
-    #     """
-    #     product_info = self.api.get_product_odata(id)
-    #     url = product_info["quicklook_url"]
-
-    #     path = Path(directory) / "{}.jpeg".format(product_info["title"])
-    #     product_info["path"] = str(path)
-    #     product_info["downloaded_bytes"] = 0
-    #     product_info["error"] = ""
-
-    #     self.logger.info("Downloading quicklook %s to %s", product_info["title"], path)
-
-    #     with self.api.dl_limit_semaphore:
-    #         r = self.api.session.get(url)
-    #     self.api._check_scihub_response(r, test_json=False)
-
-    #     product_info["quicklook_size"] = len(r.content)
-
-    #     if path.exists():
-    #         return product_info
-
-    #     content_type = r.headers["content-type"]
-    #     if content_type != "image/jpeg":
-    #         product_info["error"] = "Quicklook is not jpeg but {}".format(content_type)
-
-    #     if product_info["error"] == "":
-    #         with open(path, "wb") as fp:
-    #             fp.write(r.content)
-    #             product_info["downloaded_bytes"] = len(r.content)
-
-    #     return product_info
-
-    # def download_all_quicklooks(self, products, directory="."):
-    #     """Download quicklook for a list of products.
-
-    #     Parameters
-    #     ----------
-    #     products : dict
-    #         Dict of product IDs, product data
-    #     directory : string or Path, optional
-    #         Directory where the downloaded images will be downloaded
-    #     n_concurrent_dl : integer
-    #         Number of concurrent downloads
-
-    #     Returns
-    #     -------
-    #     dict[string, dict]
-    #         A dictionary containing the return value from download_quicklook() for each
-    #         successfully downloaded quicklook
-    #     dict[string, dict]
-    #         A dictionary containing the error of products where either
-    #         quicklook was not available or it had an unexpected content type
-    #     """
-
-    #     self.logger.info("Will download %d quicklooks", len(products))
-
-    #     downloaded_quicklooks = {}
-    #     failed_quicklooks = {}
-
-    #     with ThreadPoolExecutor(max_workers=self.n_concurrent_dl) as dl_exec:
-    #         dl_tasks = {}
-    #         for pid in products:
-    #             future = dl_exec.submit(self.download_quicklook, pid, directory)
-    #             dl_tasks[future] = pid
-
-    #         completed_tasks = concurrent.futures.as_completed(dl_tasks)
-
-    #         for future in completed_tasks:
-    #             product_info = future.result()
-    #             if product_info["error"] == "":
-    #                 downloaded_quicklooks[dl_tasks[future]] = product_info
-    #             else:
-    #                 failed_quicklooks[dl_tasks[future]] = product_info["error"]
-
-    #     ResultTuple = namedtuple("ResultTuple", ["downloaded", "failed"])
-    #     return ResultTuple(downloaded_quicklooks, failed_quicklooks)
-
-    # def _trigger_and_wait(self, uuid, stop_event, statuses):
-    #     """Continuously triggers retrieval of offline products
-
-    #     This function is supposed to be called in a separate thread. By setting stop_event it can be stopped.
-    #     """
-    #     with self.api.lta_limit_semaphore:
-    #         t0 = time.time()
-    #         while True:
-    #             if stop_event.is_set():
-    #                 raise concurrent.futures.CancelledError()
-    #             if self.lta_timeout and time.time() - t0 >= self.lta_timeout:
-    #                 raise LTAError(
-    #                     f"LTA retrieval for {uuid} timed out (lta_timeout={self.lta_timeout} seconds)"
-    #                 )
-    #             try:
-    #                 if self.api.is_online(uuid):
-    #                     break
-    #                 if statuses[uuid] == DownloadStatus.OFFLINE:
-    #                     # Trigger
-    #                     triggered = self.trigger_offline_retrieval(uuid)
-    #                     if triggered:
-    #                         statuses[uuid] = DownloadStatus.TRIGGERED
-    #                         self.logger.info(
-    #                             "%s accepted for retrieval, waiting for it to come online...", uuid
-    #                         )
-    #                     else:
-    #                         # Product is online
-    #                         break
-    #             except (LTAError, ServerError) as e:
-    #                 self.logger.info(
-    #                     "%s retrieval was not accepted: %s. Retrying in %d seconds",
-    #                     uuid,
-    #                     e.msg,
-    #                     self.lta_retry_delay,
-    #                 )
-    #             _wait(stop_event, self.lta_retry_delay)
-    #         self.logger.info("%s retrieval from LTA completed", uuid)
-    #         statuses[uuid] = DownloadStatus.ONLINE
     
     def _download_online_retry_new(self, pid: str,name: str, directory,stop_event: threading.Event,statuses):
         print(f"HEREEEEEEEEEEEEEEEEEEEEE {pid}")
         self.download(pid,directory,stop_event)
         print("caso")
 
-    def _download_online_retry(self, pid: str,name: str, directory,stop_event: threading.Event,statuses):
+    def _download_online_retry(self, pid: str,name: str, directory,stop_event: threading.Event,statuses,exceptions,product_infos,proxy=None):
         """Thin wrapper around download with retrying and checking whether a product is online
 
         Parameters
@@ -611,15 +379,19 @@ class Downloader:
             _wait(stop_event, 1)
         last_exception = None
         for cnt in range(self.max_attempts):
+            last_exception = None
             if stop_event.is_set():
                 raise concurrent.futures.CancelledError()
             try:
                 if cnt > 0:
                     _wait(stop_event, self.dl_retry_delay)
                 statuses[uuid] = DownloadStatus.DOWNLOAD_STARTED
-                return self.download(uuid, directory, stop_event=stop_event)
+                product_info = self.download(uuid, directory, stop_event=stop_event,proxy=proxy)
+                product_infos[uuid] = product_info
+                statuses[uuid] = DownloadStatus.DOWNLOADED
+                return product_info
             except (concurrent.futures.CancelledError, KeyboardInterrupt, SystemExit):
-                raise Exception("THERE WAS AN ERROR !!!")
+                raise Exception("THE DOWNLOAD WAS CANCELED!")
             except Exception as e:
                 if isinstance(e, InvalidChecksumError):
                     self.logger.warning(
@@ -635,64 +407,62 @@ class Downloader:
                         retries_remaining,
                         self.dl_retry_delay,
                     )
+                    #TODO remove this part when metadata working with partial files
+                    ff = name.replace(".SAFE",".zip")+".incomplete"
+                    path_incomplete = Path(directory) /ff
+                    print(path_incomplete)
+                    import os
+                    os.remove(path_incomplete)
                 else:
                     self.logger.info("Downloading %s failed. No retries left.", title)
                 last_exception = e
-        raise last_exception
+                exceptions[uuid] = e
+                continue
 
-    def _download(self, url, path, file_size, title, stop_event):
-        try:
-            headers = {}
-            continuing = path.exists()
-            self.api.if_token_expired_refresh()
-            access_token = self.api.token
-            if continuing:
-                already_downloaded_bytes = 0#path.stat().st_size #TODO remove this 0 #path.stat().st_size
-                print(url)
-                headers = {"Authorization": f"Bearer {access_token}","Range": "bytes={}-".format(already_downloaded_bytes)}
-                # input("????????????????????????????????????????????")
+        if last_exception is not None:
+            raise last_exception
+
+    def _download(self, url, path, file_size, title, stop_event,proxy= None):
+        headers = {}
+        continuing = path.exists()
+        self.api.if_token_expired_refresh()
+        access_token = self.api.token
+        if continuing:
+            already_downloaded_bytes = 0#path.stat().st_size #TODO remove this 0 #path.stat().st_size
+            print(url)
+            headers = {"Authorization": f"Bearer {access_token}","Range": "bytes={}-".format(already_downloaded_bytes)}
+            # input("????????????????????????????????????????????")
+        else:
+            already_downloaded_bytes = 0
+            headers = {"Authorization": f"Bearer {access_token}"}
+        downloaded_bytes = already_downloaded_bytes
+        # self.api.session.get(url, stream=True, headers=headers)
+        with self.api.dl_limit_semaphore:
+            print("GETTING DOWNLOAD",self.api.dl_limit_semaphore._value)
+            import requests
+            if proxy != None:
+                print(f"Using proxies: {proxy}")
+                input("...")
+                r = requests.get(url, stream=True, headers=headers, proxies=proxy)
             else:
-                already_downloaded_bytes = 0
-                headers = {"Authorization": f"Bearer {access_token}"}
-            downloaded_bytes = already_downloaded_bytes
-            # self.api.session.get(url, stream=True, headers=headers)
-            with self.api.dl_limit_semaphore:
-                print("GETTING DOWNLOAD",self.api.dl_limit_semaphore._value)
-                import requests
                 r = requests.get(url, stream=True, headers=headers)
-            with self._tqdm(
-                desc=f"Downloading {title}",
-                total=file_size,
-                unit="B",
-                unit_scale=True,
-                initial=already_downloaded_bytes,
-            ) as progress, closing(r):
-                # self.api._check_scihub_response(r, test_json=False)
-                mode = "ab" if continuing else "wb"
-                with open(path, mode) as f:
-                    for chunk in r.iter_content(chunk_size=self.chunk_size):
-                        if stop_event and stop_event.is_set():
-                            raise concurrent.futures.CancelledError()
-                        if chunk:  # filter out keep-alive new chunks
-                            f.write(chunk)
-                            progress.update(len(chunk))
-                            downloaded_bytes += len(chunk)
-                        #     finished = True
-                        # except Exception as e:
-                        #     self.api.if_token_expired_refresh()
-                        #     headers['Authorization'] = f'Bearer {self.api.token}'
-                        #     r = requests.get(url, stream=True, headers=headers)
-                        #     continue
-                # Return the number of bytes downloaded
-        except Exception as e:
-            print(f"EXCEPTION ON {url}")
-            print(e)
-            input("????????????????????????????????????????????")
-        try:
-            r.close()
-            print("CONNECTION CLOSED")
-        except:
-            print("CANNOT CLOSE")
+        with self._tqdm(
+            desc=f"Downloading {title}",
+            total=file_size,
+            unit="B",
+            unit_scale=True,
+            initial=already_downloaded_bytes,
+        ) as progress, closing(r):
+            # self.api._check_scihub_response(r, test_json=False)
+            mode = "ab" if continuing else "wb"
+            with open(path, mode) as f:
+                for chunk in r.iter_content(chunk_size=self.chunk_size):
+                    if stop_event and stop_event.is_set():
+                        raise concurrent.futures.CancelledError()
+                    if chunk:  # filter out keep-alive new chunks
+                        f.write(chunk)
+                        progress.update(len(chunk))
+                        downloaded_bytes += len(chunk)
         return downloaded_bytes
 
     def _dataobj_to_node_info(self, dataobj_info, product_info):
